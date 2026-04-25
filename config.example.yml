@@ -1,0 +1,12 @@
+trusted_sender: "@your-user:your.homeserver"
+mention_user: "@your-user:your.homeserver"
+poll_interval_seconds: 5
+max_message_length: 4000
+
+agents:
+  research:
+    room_id: "!roomid:your.homeserver"
+    project_dir: "/home/user/.claude/projects/research"
+  dev:
+    room_id: "!roomid:your.homeserver"
+    project_dir: "/home/user/.claude/projects/dev"

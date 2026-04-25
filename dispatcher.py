@@ -337,6 +337,13 @@ async def _run_claude(
     except asyncio.TimeoutError:
         proc.kill()
         await proc.wait()
+        # Drain pipe transports — wait_for cancelled communicate() mid-read,
+        # leaving stdout/stderr file descriptors open. communicate() is
+        # idempotent post-exit and closes the transports.
+        try:
+            await proc.communicate()
+        except Exception:
+            pass
         raise
     finally:
         _active_processes.pop(room_id, None)
@@ -495,7 +502,12 @@ def read_last_n_turns(session_id: str, project_dir: str, n: int) -> str:
 
 
 def find_unmirrored_session_id(db: sqlite3.Connection, project_dir: str, room_id: str) -> str | None:
-    """Find the most recent JSONL session in project_dir not yet tracked for this room."""
+    """Find the most recent JSONL session in project_dir not yet tracked for this room.
+
+    Only files whose stem parses as a UUID are considered — the value flows into
+    `claude -p --resume <session_id>` as argv, so anything starting with `-` or
+    otherwise unstructured must be rejected before reaching the subprocess.
+    """
     jsonl_dir = project_jsonl_dir(project_dir)
     if not jsonl_dir.exists():
         return None
@@ -506,6 +518,10 @@ def find_unmirrored_session_id(db: sqlite3.Connection, project_dir: str, room_id
     candidates: list[Path] = []
     for path in jsonl_dir.glob("*.jsonl"):
         if path.stem in known:
+            continue
+        try:
+            uuid.UUID(path.stem)
+        except ValueError:
             continue
         candidates.append(path)
     if not candidates:

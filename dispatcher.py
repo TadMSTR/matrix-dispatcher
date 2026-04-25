@@ -64,6 +64,12 @@ def open_db() -> sqlite3.Connection:
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA foreign_keys=ON")
+    # Tighten permissions on the DB and its WAL/SHM siblings — defense-in-depth
+    # against accidental world-readability (session_id values are usable with --resume).
+    for suffix in ("", "-wal", "-shm"):
+        path = Path(str(DB_PATH) + suffix)
+        if path.exists():
+            os.chmod(path, 0o600)
     return db
 
 
@@ -329,16 +335,30 @@ def extract_thread_root(event: RoomMessageText) -> str | None:
 
     Handles both proper Matrix threads (rel_type=m.thread, event_id=thread_root)
     and simple in-reply-to chains (falls back to the replied-to event ID).
+    Rejects malformed event metadata (non-string event_id) rather than letting
+    bad values flow into SQLite parameter binding.
     """
     source = getattr(event, "source", {})
     content = source.get("content", {}) if isinstance(source, dict) else {}
     relates_to = content.get("m.relates_to")
-    if not relates_to:
+    if not isinstance(relates_to, dict):
         return None
+    candidate: object | None = None
     if relates_to.get("rel_type") == "m.thread":
-        return relates_to.get("event_id")
-    in_reply_to = relates_to.get("m.in_reply_to", {})
-    return in_reply_to.get("event_id")
+        candidate = relates_to.get("event_id")
+    else:
+        in_reply_to = relates_to.get("m.in_reply_to")
+        if isinstance(in_reply_to, dict):
+            candidate = in_reply_to.get("event_id")
+    if candidate is None:
+        return None
+    if not isinstance(candidate, str):
+        log.warning(
+            "action=malformed_relates_to event_id=%s type=%s",
+            getattr(event, "event_id", "?"), type(candidate).__name__,
+        )
+        return None
+    return candidate
 
 
 async def _post_response(

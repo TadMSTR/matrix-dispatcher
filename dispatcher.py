@@ -1,9 +1,12 @@
 """Matrix dispatcher — spawn or resume claude -p sessions from Matrix room messages.
 
-v3: SQLite + thread-based resume + slash commands (/sessions, /recap, /mirror,
-/help) + nightly retention cleanup. Thread replies resume existing sessions via
---resume <session_id>; room-root messages spawn fresh sessions; commands are
-intercepted and handled by the dispatcher (no claude spawn).
+v4: Hardening — async subprocess (asyncio.create_subprocess_exec, no event-loop
+blocking), per-room concurrency lock, per-room rate limit on spawns, /cancel
+command (SIGTERM the active subprocess), startup notification.
+
+v3: Slash commands (/sessions, /recap, /mirror, /help, /cancel) + nightly cleanup.
+v2: SQLite + thread-based resume.
+v1: Spawn-only loop.
 
 Security flags addressed:
   B: Dispatcher credentials loaded from DISPATCHER_* env vars (asserted at startup).
@@ -19,8 +22,8 @@ import asyncio
 import json
 import logging
 import os
+import signal
 import sqlite3
-import subprocess
 import sys
 import time
 import uuid
@@ -28,6 +31,24 @@ from pathlib import Path
 
 import yaml
 from nio import AsyncClient, RoomMessageText, SyncResponse
+
+# ---------------------------------------------------------------------------
+# Runtime state — per-room locks, active processes, rate-limit timestamps.
+# Process-local; lost on restart (acceptable — orphaned procs run to completion).
+# ---------------------------------------------------------------------------
+
+_room_locks: dict[str, asyncio.Lock] = {}
+_active_processes: dict[str, asyncio.subprocess.Process] = {}
+_last_spawn_at: dict[str, float] = {}
+
+SUBPROCESS_TIMEOUT_SECONDS = 300
+RATE_LIMIT_SECONDS = 10
+
+
+def _room_lock(room_id: str) -> asyncio.Lock:
+    if room_id not in _room_locks:
+        _room_locks[room_id] = asyncio.Lock()
+    return _room_locks[room_id]
 
 # ---------------------------------------------------------------------------
 # Logging — structured, no message body content
@@ -291,40 +312,66 @@ def _minimal_env(agent_name: str) -> dict[str, str]:
     return env
 
 
-def spawn_claude(
+async def _run_claude(
+    args: list[str],
+    project_dir: str,
+    agent_name: str,
+    room_id: str,
+) -> tuple[int, str]:
+    """Run claude with the given args, registering the process for /cancel.
+
+    Returns (exit_code, output). Raises asyncio.TimeoutError on timeout.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=project_dir,
+        env=_minimal_env(agent_name),
+    )
+    _active_processes[room_id] = proc
+    try:
+        stdout_b, stderr_b = await asyncio.wait_for(
+            proc.communicate(), timeout=SUBPROCESS_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise
+    finally:
+        _active_processes.pop(room_id, None)
+
+    rc = proc.returncode if proc.returncode is not None else -1
+    stdout = stdout_b.decode(errors="replace").strip()
+    stderr = stderr_b.decode(errors="replace").strip()
+    output = stdout if rc == 0 else stderr[:500]
+    return rc, output
+
+
+async def spawn_claude(
     session_id: str,
     prompt: str,
     project_dir: str,
     agent_name: str,
+    room_id: str,
 ) -> tuple[int, str]:
-    result = subprocess.run(
+    return await _run_claude(
         ["claude", "-p", "--session-id", session_id, prompt],
-        capture_output=True,
-        text=True,
-        cwd=project_dir,
-        env=_minimal_env(agent_name),
-        timeout=300,
+        project_dir, agent_name, room_id,
     )
-    output = result.stdout.strip() if result.returncode == 0 else result.stderr.strip()[:500]
-    return result.returncode, output
 
 
-def resume_claude(
+async def resume_claude(
     session_id: str,
     message: str,
     project_dir: str,
     agent_name: str,
+    room_id: str,
 ) -> tuple[int, str]:
-    result = subprocess.run(
+    return await _run_claude(
         ["claude", "-p", "--resume", session_id, message],
-        capture_output=True,
-        text=True,
-        cwd=project_dir,
-        env=_minimal_env(agent_name),
-        timeout=300,
+        project_dir, agent_name, room_id,
     )
-    output = result.stdout.strip() if result.returncode == 0 else result.stderr.strip()[:500]
-    return result.returncode, output
 
 
 # ---------------------------------------------------------------------------
@@ -502,8 +549,34 @@ HELP_TEXT = (
     "  /sessions       — list recent sessions (reply to one to resume)\n"
     "  /recap [N]      — show last N turns of most recent session (default: 5)\n"
     "  /mirror         — link most recent CloudCLI session to this room for resume\n"
+    "  /cancel         — SIGTERM the active session in this room\n"
     "  /help           — this message"
 )
+
+
+async def handle_cancel_command(
+    client: AsyncClient, room_id: str, event: RoomMessageText, mention_user: str,
+) -> None:
+    proc = _active_processes.get(room_id)
+    if proc is None:
+        log.info("action=cmd_cancel_noop room=%s event_id=%s", room_id, event.event_id)
+        await post_message(
+            client, room_id,
+            f"{mention_user} No active session in this room.",
+            reply_to=event.event_id,
+        )
+        return
+    pid = proc.pid
+    log.info("action=cmd_cancel room=%s event_id=%s pid=%s", room_id, event.event_id, pid)
+    try:
+        proc.send_signal(signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    await post_message(
+        client, room_id,
+        f"{mention_user} Sent SIGTERM to active session (pid {pid}).",
+        reply_to=event.event_id,
+    )
 
 
 async def handle_help_command(
@@ -675,6 +748,8 @@ async def handle_event(
             await handle_mirror_command(
                 client, room_id, event, mention_user, agent_name, project_dir, db,
             )
+        elif cmd == "/cancel":
+            await handle_cancel_command(client, room_id, event, mention_user)
         else:
             log.info(
                 "action=command_unknown room=%s event_id=%s cmd=%s",
@@ -687,7 +762,7 @@ async def handle_event(
             )
         return
 
-    # Thread reply → attempt resume
+    # Thread reply → attempt resume (per-room lock serializes with other work)
     if thread_root is not None:
         row = get_session_by_event(db, thread_root)
         if row is not None:
@@ -703,16 +778,19 @@ async def handle_event(
                 reply_to=event.event_id,
             )
             register_alias(db, ack_event_id, thread_root_id)
-            try:
-                exit_code, output = resume_claude(session_id, user_message, project_dir, agent_name)
-            except subprocess.TimeoutExpired:
-                log.error("action=resume_timeout room=%s session=%s", room_id, session_id)
-                await post_message(
-                    client, room_id,
-                    f"{mention_user} Session {short_id} timed out after 300s.",
-                    reply_to=ack_event_id or event.event_id,
-                )
-                return
+            async with _room_lock(room_id):
+                try:
+                    exit_code, output = await resume_claude(
+                        session_id, user_message, project_dir, agent_name, room_id,
+                    )
+                except asyncio.TimeoutError:
+                    log.error("action=resume_timeout room=%s session=%s", room_id, session_id)
+                    await post_message(
+                        client, room_id,
+                        f"{mention_user} Session {short_id} timed out after 300s.",
+                        reply_to=ack_event_id or event.event_id,
+                    )
+                    return
             touch_session(db, thread_root_id)
             log.info(
                 "action=resume_complete room=%s session=%s exit_code=%d",
@@ -733,7 +811,24 @@ async def handle_event(
             room_id, event.event_id, thread_root,
         )
 
-    # Room-root (or orphaned reply) → spawn new session
+    # Room-root (or orphaned reply) → spawn new session.
+    # Rate-limit applies to spawns only — runaway-loop guard, not user friction.
+    now = time.time()
+    last = _last_spawn_at.get(room_id, 0.0)
+    if now - last < RATE_LIMIT_SECONDS:
+        remaining = int(RATE_LIMIT_SECONDS - (now - last))
+        log.info(
+            "action=rate_limited room=%s event_id=%s remaining=%d",
+            room_id, event.event_id, remaining,
+        )
+        await post_message(
+            client, room_id,
+            f"{mention_user} Rate-limited; try again in {remaining}s.",
+            reply_to=event.event_id,
+        )
+        return
+    _last_spawn_at[room_id] = now
+
     session_id = str(uuid.uuid4())
     short_id = session_id[:8]
     log.info(
@@ -756,16 +851,19 @@ async def handle_event(
         f"the dispatcher will post your stdout to the room automatically.]\n\n"
         f"{user_message}"
     )
-    try:
-        exit_code, output = spawn_claude(session_id, prompt, project_dir, agent_name)
-    except subprocess.TimeoutExpired:
-        log.error("action=spawn_timeout room=%s session=%s", room_id, session_id)
-        await post_message(
-            client, room_id,
-            f"{mention_user} Session {short_id} timed out after 300s.",
-            reply_to=ack_event_id or event.event_id,
-        )
-        return
+    async with _room_lock(room_id):
+        try:
+            exit_code, output = await spawn_claude(
+                session_id, prompt, project_dir, agent_name, room_id,
+            )
+        except asyncio.TimeoutError:
+            log.error("action=spawn_timeout room=%s session=%s", room_id, session_id)
+            await post_message(
+                client, room_id,
+                f"{mention_user} Session {short_id} timed out after 300s.",
+                reply_to=ack_event_id or event.event_id,
+            )
+            return
     log.info(
         "action=spawn_complete room=%s session=%s exit_code=%d",
         room_id, session_id, exit_code,
@@ -874,6 +972,19 @@ async def main() -> None:
     client.user_id = user_id
 
     log.info("action=startup user_id=%s homeserver=%s", user_id, homeserver)
+
+    # Startup notification — post to one of the configured agent rooms
+    notify_agent = config.get("startup_notification_agent", "claudebox")
+    agents_cfg = config.get("agents", {})
+    notify_room = (agents_cfg.get(notify_agent) or {}).get("room_id")
+    if notify_room:
+        try:
+            await post_message(
+                client, notify_room,
+                f"matrix-dispatcher started — agents: {list(agents_cfg.keys())}",
+            )
+        except Exception:
+            log.exception("action=startup_notify_error")
 
     cleanup_task = asyncio.create_task(cleanup_loop(db, retention_days))
     try:

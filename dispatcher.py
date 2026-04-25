@@ -458,7 +458,15 @@ async def handle_event(
     insert_session(db, event.event_id, room_id, agent_name, session_id)
     register_alias(db, ack_event_id, event.event_id)
 
-    prompt = f"[Invoked via Matrix room #{agent_name} by @ted]\n\n{user_message}"
+    # The dispatcher owns all Matrix posting. Agents must NOT call any Matrix
+    # or mcp__matrix__ tools — doing so causes double-posts and permission blocks.
+    prompt = (
+        f"[Invoked via Matrix room #{agent_name} by @ted. "
+        f"Output your response as plain text only. "
+        f"Do NOT use mcp__matrix__ tools or any Matrix MCP — "
+        f"the dispatcher will post your stdout to the room automatically.]\n\n"
+        f"{user_message}"
+    )
     try:
         exit_code, output = spawn_claude(session_id, prompt, project_dir, agent_name)
     except subprocess.TimeoutExpired:

@@ -51,14 +51,20 @@ def load_config() -> dict:
 
 
 def load_poll_tokens() -> dict[str, str]:
-    if POLL_TOKEN_PATH.exists():
+    if not POLL_TOKEN_PATH.exists():
+        return {}
+    try:
         return json.loads(POLL_TOKEN_PATH.read_text())
-    return {}
+    except json.JSONDecodeError as e:
+        log.warning("action=poll_token_corrupt path=%s err=%s", POLL_TOKEN_PATH, e)
+        return {}
 
 
 def save_poll_tokens(tokens: dict[str, str]) -> None:
     POLL_TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
-    POLL_TOKEN_PATH.write_text(json.dumps(tokens, indent=2))
+    tmp = POLL_TOKEN_PATH.with_suffix(POLL_TOKEN_PATH.suffix + ".tmp")
+    tmp.write_text(json.dumps(tokens, indent=2))
+    tmp.replace(POLL_TOKEN_PATH)
 
 
 # ---------------------------------------------------------------------------
@@ -156,10 +162,13 @@ def spawn_claude(
         "USER": os.environ.get("USER", "ted"),
     }
 
-    # Pass through CLAUDE_* vars required by claude -p if present
-    for key, val in os.environ.items():
-        if key.startswith("CLAUDE_"):
-            minimal_env[key] = val
+    # Explicit allowlist — never glob CLAUDE_*, which would leak any
+    # CLAUDE_API_KEY / CLAUDE_CODE_OAUTH_TOKEN added to the dispatcher env
+    # file or inherited from PM2's parent env into every spawned subprocess.
+    CLAUDE_PASSTHROUGH = ("CLAUDE_CONFIG_DIR",)
+    for key in CLAUDE_PASSTHROUGH:
+        if key in os.environ:
+            minimal_env[key] = os.environ[key]
 
     result = subprocess.run(
         ["claude", "-p", "--session-id", session_id, prompt],
@@ -284,6 +293,19 @@ async def poll_loop(client: AsyncClient, config: dict) -> None:
     poll_tokens = load_poll_tokens()
     # Use a single since token across all rooms (Matrix sync is global)
     since: str | None = poll_tokens.get("global_since")
+
+    # Cold-start seeding: with since=None, /sync returns recent timeline events.
+    # Iterating those would re-spawn claude for already-answered messages. Run
+    # one priming sync to capture next_batch without processing any events.
+    if since is None:
+        seed = await client.sync(timeout=0, since=None, full_state=False)
+        if isinstance(seed, SyncResponse):
+            since = seed.next_batch
+            poll_tokens["global_since"] = since
+            save_poll_tokens(poll_tokens)
+            log.info("action=poll_seed since=%s", since)
+        else:
+            log.warning("action=poll_seed_error response=%s", type(seed).__name__)
 
     log.info("action=poll_start agents=%s since=%s", list(agents.keys()), since)
 

@@ -4,7 +4,7 @@ v4: Hardening — async subprocess (asyncio.create_subprocess_exec, no event-loo
 blocking), per-room concurrency lock, per-room rate limit on spawns, /cancel
 command (SIGTERM the active subprocess), startup notification.
 
-v3: Slash commands (/sessions, /recap, /mirror, /help, /cancel) + nightly cleanup.
+v3: Bang-prefix commands (!sessions, !recap, !mirror, !help, !cancel) + nightly cleanup.
 v2: SQLite + thread-based resume.
 v1: Spawn-only loop.
 
@@ -545,12 +545,12 @@ async def _post_response(
 
 
 HELP_TEXT = (
-    "Dispatcher commands:\n"
-    "  /sessions       — list recent sessions (reply to one to resume)\n"
-    "  /recap [N]      — show last N turns of most recent session (default: 5)\n"
-    "  /mirror         — link most recent CloudCLI session to this room for resume\n"
-    "  /cancel         — SIGTERM the active session in this room\n"
-    "  /help           — this message"
+    "Dispatcher commands (! prefix — Element intercepts /-commands client-side):\n"
+    "  !sessions       — list recent sessions (reply to one to resume)\n"
+    "  !recap [N]      — show last N turns of most recent session (default: 5)\n"
+    "  !mirror         — link most recent CloudCLI session to this room for resume\n"
+    "  !cancel         — SIGTERM the active session in this room\n"
+    "  !help           — this message"
 )
 
 
@@ -728,27 +728,29 @@ async def handle_event(
     thread_root = extract_thread_root(event)
 
     # Commands intercepted on room-root messages only — thread replies starting
-    # with "/" pass through to the resumed session as ordinary text.
-    if thread_root is None and user_message.startswith("/"):
+    # with "!" pass through to the resumed session as ordinary text. The "!"
+    # prefix is used because Element intercepts "/" client-side as IRC-style
+    # commands (e.g. /me, /join, /help) and never sends them to Matrix.
+    if thread_root is None and user_message.startswith("!"):
         parts = user_message.split(maxsplit=1)
         cmd = parts[0].lower()
         arg = parts[1] if len(parts) > 1 else ""
-        if cmd == "/help":
+        if cmd == "!help":
             await handle_help_command(client, room_id, event, mention_user)
-        elif cmd == "/sessions":
+        elif cmd == "!sessions":
             await handle_sessions_command(
                 client, room_id, event, mention_user, agent_name, project_dir, db,
             )
-        elif cmd == "/recap":
+        elif cmd == "!recap":
             await handle_recap_command(
                 client, room_id, event, mention_user, project_dir, db,
                 max_message_length, arg,
             )
-        elif cmd == "/mirror":
+        elif cmd == "!mirror":
             await handle_mirror_command(
                 client, room_id, event, mention_user, agent_name, project_dir, db,
             )
-        elif cmd == "/cancel":
+        elif cmd == "!cancel":
             await handle_cancel_command(client, room_id, event, mention_user)
         else:
             log.info(
@@ -757,7 +759,7 @@ async def handle_event(
             )
             await post_message(
                 client, room_id,
-                f"{mention_user} Unknown command `{cmd}`. Send `/help` for the list.",
+                f"{mention_user} Unknown command `{cmd}`. Send `!help` for the list.",
                 reply_to=event.event_id,
             )
         return

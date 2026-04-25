@@ -2,6 +2,7 @@ trusted_sender: "@your-user:your.homeserver"
 mention_user: "@your-user:your.homeserver"
 poll_interval_seconds: 5
 max_message_length: 4000
+session_retention_days: 30
 
 agents:
   research:

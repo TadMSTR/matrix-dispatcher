@@ -1,8 +1,9 @@
 """Matrix dispatcher — spawn or resume claude -p sessions from Matrix room messages.
 
-v2: SQLite + thread-based resume. Thread replies resume existing sessions via
---resume <session_id>; room-root messages spawn fresh sessions. Poll state
-migrated from v1 JSON file to poll_state table.
+v3: SQLite + thread-based resume + slash commands (/sessions, /recap, /mirror,
+/help) + nightly retention cleanup. Thread replies resume existing sessions via
+--resume <session_id>; room-root messages spawn fresh sessions; commands are
+intercepted and handled by the dispatcher (no claude spawn).
 
 Security flags addressed:
   B: Dispatcher credentials loaded from DISPATCHER_* env vars (asserted at startup).
@@ -361,6 +362,110 @@ def extract_thread_root(event: RoomMessageText) -> str | None:
     return candidate
 
 
+# ---------------------------------------------------------------------------
+# JSONL transcript helpers — read claude -p session transcripts for
+# /sessions, /recap, /mirror commands.
+# ---------------------------------------------------------------------------
+
+def project_jsonl_dir(project_dir: str) -> Path:
+    """Convert a project directory path to its claude-code JSONL transcript dir."""
+    encoded = project_dir.replace("/", "-")
+    return Path.home() / ".claude" / "projects" / encoded
+
+
+def _extract_text(content: object) -> str:
+    """Best-effort text extraction from a claude transcript content field."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                text = block.get("text", "")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "\n".join(parts)
+    return ""
+
+
+def read_first_user_message(session_id: str, project_dir: str, max_len: int = 80) -> str:
+    """Return a one-line summary from the first user turn in the transcript."""
+    jsonl = project_jsonl_dir(project_dir) / f"{session_id}.jsonl"
+    if not jsonl.exists():
+        return "(transcript missing)"
+    try:
+        with jsonl.open() as f:
+            for line in f:
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("type") != "user":
+                    continue
+                msg = obj.get("message", {})
+                text = _extract_text(msg.get("content", "")).strip()
+                # Strip dispatcher's injected prefix
+                if text.startswith("[Invoked via Matrix"):
+                    text = text.split("\n\n", 1)[-1]
+                first_line = text.split("\n", 1)[0].strip()
+                if not first_line:
+                    continue
+                return first_line[:max_len] + ("…" if len(first_line) > max_len else "")
+    except OSError as e:
+        log.warning("action=transcript_read_error session=%s err=%s", session_id, e)
+        return "(transcript error)"
+    return "(no user message)"
+
+
+def read_last_n_turns(session_id: str, project_dir: str, n: int) -> str:
+    """Return the last n user+assistant turns formatted as a Matrix-friendly recap."""
+    jsonl = project_jsonl_dir(project_dir) / f"{session_id}.jsonl"
+    if not jsonl.exists():
+        return ""
+    turns: list[tuple[str, str]] = []
+    try:
+        with jsonl.open() as f:
+            for line in f:
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                role = obj.get("type")
+                if role not in ("user", "assistant"):
+                    continue
+                msg = obj.get("message", {})
+                text = _extract_text(msg.get("content", "")).strip()
+                if not text:
+                    continue
+                if role == "user" and text.startswith("[Invoked via Matrix"):
+                    text = text.split("\n\n", 1)[-1]
+                turns.append((role, text))
+    except OSError as e:
+        log.warning("action=transcript_read_error session=%s err=%s", session_id, e)
+        return ""
+    pairs = turns[-(2 * n):]
+    return "\n\n".join(f"**{role}:**\n{text}" for role, text in pairs)
+
+
+def find_unmirrored_session_id(db: sqlite3.Connection, project_dir: str, room_id: str) -> str | None:
+    """Find the most recent JSONL session in project_dir not yet tracked for this room."""
+    jsonl_dir = project_jsonl_dir(project_dir)
+    if not jsonl_dir.exists():
+        return None
+    rows = db.execute(
+        "SELECT session_id FROM sessions WHERE room_id = ?", (room_id,)
+    ).fetchall()
+    known = {r["session_id"] for r in rows}
+    candidates: list[Path] = []
+    for path in jsonl_dir.glob("*.jsonl"):
+        if path.stem in known:
+            continue
+        candidates.append(path)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime).stem
+
+
 async def _post_response(
     client: AsyncClient,
     room_id: str,
@@ -392,6 +497,145 @@ async def _post_response(
         register_alias(db, event_id, thread_root_id)
 
 
+HELP_TEXT = (
+    "Dispatcher commands:\n"
+    "  /sessions       — list recent sessions (reply to one to resume)\n"
+    "  /recap [N]      — show last N turns of most recent session (default: 5)\n"
+    "  /mirror         — link most recent CloudCLI session to this room for resume\n"
+    "  /help           — this message"
+)
+
+
+async def handle_help_command(
+    client: AsyncClient, room_id: str, event: RoomMessageText, mention_user: str,
+) -> None:
+    log.info("action=cmd_help room=%s event_id=%s", room_id, event.event_id)
+    await post_message(
+        client, room_id, f"{mention_user}\n\n{HELP_TEXT}", reply_to=event.event_id,
+    )
+
+
+async def handle_sessions_command(
+    client: AsyncClient, room_id: str, event: RoomMessageText, mention_user: str,
+    agent_name: str, project_dir: str, db: sqlite3.Connection,
+) -> None:
+    log.info("action=cmd_sessions room=%s event_id=%s", room_id, event.event_id)
+    rows = db.execute(
+        "SELECT * FROM sessions WHERE room_id = ? ORDER BY last_used_at DESC LIMIT 10",
+        (room_id,),
+    ).fetchall()
+    if not rows:
+        await post_message(
+            client, room_id, f"{mention_user} No sessions yet in this room.",
+            reply_to=event.event_id,
+        )
+        return
+    header_event_id = await post_message(
+        client, room_id,
+        f"{mention_user} Recent sessions in #{agent_name} (reply to one to resume):",
+        reply_to=event.event_id,
+    )
+    for i, row in enumerate(rows, 1):
+        summary = read_first_user_message(row["session_id"], project_dir)
+        text = f"{i}. ({row['session_id'][:8]}) {summary}"
+        list_event_id = await post_message(
+            client, room_id, text, reply_to=header_event_id,
+        )
+        # Reply to this list-item event resolves to the session via event_aliases
+        register_alias(db, list_event_id, row["thread_root_id"])
+
+
+def _parse_recap_n(arg: str, default: int = 5) -> int:
+    try:
+        n = int(arg.strip())
+    except ValueError:
+        return default
+    return max(1, min(n, 20))
+
+
+async def handle_recap_command(
+    client: AsyncClient, room_id: str, event: RoomMessageText, mention_user: str,
+    project_dir: str, db: sqlite3.Connection, max_message_length: int, arg: str,
+) -> None:
+    n = _parse_recap_n(arg)
+    log.info("action=cmd_recap room=%s event_id=%s n=%d", room_id, event.event_id, n)
+    row = db.execute(
+        "SELECT * FROM sessions WHERE room_id = ? ORDER BY last_used_at DESC LIMIT 1",
+        (room_id,),
+    ).fetchone()
+    if row is None:
+        await post_message(
+            client, room_id, f"{mention_user} No prior sessions to recap.",
+            reply_to=event.event_id,
+        )
+        return
+    body = read_last_n_turns(row["session_id"], project_dir, n)
+    if not body:
+        await post_message(
+            client, room_id,
+            f"{mention_user} Session {row['session_id'][:8]} has no readable turns.",
+            reply_to=event.event_id,
+        )
+        return
+    header = f"{mention_user} Recap of session {row['session_id'][:8]} (last {n} turns):\n\n"
+    chunks = split_on_paragraphs(header + body, max_message_length)
+    for chunk in chunks:
+        await post_message(client, room_id, chunk, reply_to=event.event_id)
+
+
+async def handle_mirror_command(
+    client: AsyncClient, room_id: str, event: RoomMessageText, mention_user: str,
+    agent_name: str, project_dir: str, db: sqlite3.Connection,
+) -> None:
+    log.info("action=cmd_mirror room=%s event_id=%s", room_id, event.event_id)
+    session_id = find_unmirrored_session_id(db, project_dir, room_id)
+    if session_id is None:
+        await post_message(
+            client, room_id,
+            f"{mention_user} No unmirrored CloudCLI sessions found for #{agent_name}.",
+            reply_to=event.event_id,
+        )
+        return
+    insert_session(db, event.event_id, room_id, agent_name, session_id)
+    response_event_id = await post_message(
+        client, room_id,
+        f"{mention_user} Linked session {session_id[:8]} to this thread. "
+        f"Reply here to resume.",
+        reply_to=event.event_id,
+    )
+    register_alias(db, response_event_id, event.event_id)
+
+
+# ---------------------------------------------------------------------------
+# Retention cleanup
+# ---------------------------------------------------------------------------
+
+def run_cleanup(db: sqlite3.Connection, retention_days: int) -> tuple[int, int]:
+    cutoff = int(time.time()) - retention_days * 86400
+    cur = db.execute("DELETE FROM sessions WHERE last_used_at < ?", (cutoff,))
+    sessions_deleted = cur.rowcount
+    cur = db.execute(
+        "DELETE FROM event_aliases "
+        "WHERE thread_root_id NOT IN (SELECT thread_root_id FROM sessions)"
+    )
+    aliases_deleted = cur.rowcount
+    db.commit()
+    log.info(
+        "action=cleanup sessions_deleted=%d aliases_deleted=%d retention_days=%d",
+        sessions_deleted, aliases_deleted, retention_days,
+    )
+    return sessions_deleted, aliases_deleted
+
+
+async def cleanup_loop(db: sqlite3.Connection, retention_days: int) -> None:
+    while True:
+        try:
+            run_cleanup(db, retention_days)
+        except Exception:
+            log.exception("action=cleanup_error")
+        await asyncio.sleep(86400)
+
+
 async def handle_event(
     client: AsyncClient,
     room_id: str,
@@ -410,12 +654,37 @@ async def handle_event(
     user_message = event.body.strip()
     thread_root = extract_thread_root(event)
 
-    # Commands only intercepted on room-root messages (v3 — stub in v2)
+    # Commands intercepted on room-root messages only — thread replies starting
+    # with "/" pass through to the resumed session as ordinary text.
     if thread_root is None and user_message.startswith("/"):
-        log.info(
-            "action=command_ignored room=%s event_id=%s body_prefix=%s",
-            room_id, event.event_id, user_message[:20],
-        )
+        parts = user_message.split(maxsplit=1)
+        cmd = parts[0].lower()
+        arg = parts[1] if len(parts) > 1 else ""
+        if cmd == "/help":
+            await handle_help_command(client, room_id, event, mention_user)
+        elif cmd == "/sessions":
+            await handle_sessions_command(
+                client, room_id, event, mention_user, agent_name, project_dir, db,
+            )
+        elif cmd == "/recap":
+            await handle_recap_command(
+                client, room_id, event, mention_user, project_dir, db,
+                max_message_length, arg,
+            )
+        elif cmd == "/mirror":
+            await handle_mirror_command(
+                client, room_id, event, mention_user, agent_name, project_dir, db,
+            )
+        else:
+            log.info(
+                "action=command_unknown room=%s event_id=%s cmd=%s",
+                room_id, event.event_id, cmd[:20],
+            )
+            await post_message(
+                client, room_id,
+                f"{mention_user} Unknown command `{cmd}`. Send `/help` for the list.",
+                reply_to=event.event_id,
+            )
         return
 
     # Thread reply → attempt resume
@@ -598,18 +867,40 @@ async def main() -> None:
     init_db(db)
     migrate_v1_tokens(db)
 
+    retention_days = int(config.get("session_retention_days", 30))
+
     client = AsyncClient(homeserver, user_id)
     client.access_token = token
     client.user_id = user_id
 
     log.info("action=startup user_id=%s homeserver=%s", user_id, homeserver)
 
+    cleanup_task = asyncio.create_task(cleanup_loop(db, retention_days))
     try:
         await poll_loop(client, config, db)
     finally:
+        cleanup_task.cancel()
+        try:
+            await cleanup_task
+        except (asyncio.CancelledError, Exception):
+            pass
         db.close()
         await client.close()
 
 
+def cli_cleanup() -> int:
+    """Run retention cleanup once and exit (for manual / cron invocation)."""
+    config = load_config()
+    db = open_db()
+    init_db(db)
+    retention_days = int(config.get("session_retention_days", 30))
+    sessions_deleted, aliases_deleted = run_cleanup(db, retention_days)
+    db.close()
+    print(f"sessions_deleted={sessions_deleted} aliases_deleted={aliases_deleted}")
+    return 0
+
+
 if __name__ == "__main__":
+    if "--cleanup" in sys.argv:
+        sys.exit(cli_cleanup())
     asyncio.run(main())

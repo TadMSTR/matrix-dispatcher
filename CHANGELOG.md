@@ -2,6 +2,31 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-04-25
+
+### Added
+- `/cancel` command — sends SIGTERM to the active subprocess in the room and posts confirmation
+- Per-room concurrency lock (`_room_locks`) — serializes spawn/resume per agent so two messages in the same room don't interleave
+- Per-room rate limit on spawns (10s minimum gap, runaway-loop guard); resumes are unaffected
+- Startup notification — posts to a configurable `startup_notification_agent` room (default `claudebox`) on dispatcher launch
+
+### Changed
+- Migrated `subprocess.run` → `asyncio.create_subprocess_exec` + `asyncio.wait_for` (resolves Phase 2 audit finding L2 — async loop no longer blocks for the duration of a session)
+- `spawn_claude` and `resume_claude` are now async and accept `room_id` so the active process can be tracked for `/cancel`
+- Active subprocesses tracked in `_active_processes[room_id]` for the duration of the run
+- Help text updated to include `/cancel`
+
+## [0.3.0] - 2026-04-25
+
+### Added
+- `/help` — list of dispatcher commands
+- `/sessions` — show 10 most recent sessions in the room as numbered items; replying to one resumes it
+- `/recap [N]` — read the most recent session's JSONL transcript and post the last N user+assistant turns (default 5, cap 20); read-only, no spawn
+- `/mirror` — register the most recent untracked JSONL session in `project_dir` under a new thread root, allowing CloudCLI sessions to be resumed via Matrix replies
+- Retention cleanup — `cleanup_loop()` runs at startup and every 24h, deleting sessions older than `session_retention_days` (default 30) plus orphaned event_aliases
+- `python dispatcher.py --cleanup` — manual cleanup mode
+- `session_retention_days` config option (default 30)
+
 ## [0.2.0] - 2026-04-25
 
 ### Added

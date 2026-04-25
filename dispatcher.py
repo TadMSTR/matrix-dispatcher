@@ -40,9 +40,16 @@ from nio import AsyncClient, RoomMessageText, SyncResponse
 _room_locks: dict[str, asyncio.Lock] = {}
 _active_processes: dict[str, asyncio.subprocess.Process] = {}
 _last_spawn_at: dict[str, float] = {}
+# Outstanding handler tasks — kept as strong refs (set discards on done callback)
+# so the GC doesn't collect mid-flight handlers, and so shutdown can await them.
+_handlers: set[asyncio.Task] = set()
 
 SUBPROCESS_TIMEOUT_SECONDS = 300
 RATE_LIMIT_SECONDS = 10
+# Brief retry window for !cancel when the spawn is mid-`create_subprocess_exec`
+# (proc not yet registered in _active_processes).
+CANCEL_REGISTRATION_WAIT_SECONDS = 1.0
+CANCEL_POLL_INTERVAL_SECONDS = 0.05
 
 
 def _room_lock(room_id: str) -> asyncio.Lock:
@@ -574,6 +581,18 @@ async def handle_cancel_command(
     client: AsyncClient, room_id: str, event: RoomMessageText, mention_user: str,
 ) -> None:
     proc = _active_processes.get(room_id)
+    # If the room lock is held but no proc is registered yet, the spawn is
+    # mid-`create_subprocess_exec`. Wait briefly for it to land.
+    if proc is None:
+        lock = _room_locks.get(room_id)
+        if lock is not None and lock.locked():
+            elapsed = 0.0
+            while elapsed < CANCEL_REGISTRATION_WAIT_SECONDS:
+                await asyncio.sleep(CANCEL_POLL_INTERVAL_SECONDS)
+                elapsed += CANCEL_POLL_INTERVAL_SECONDS
+                proc = _active_processes.get(room_id)
+                if proc is not None:
+                    break
     if proc is None:
         log.info("action=cmd_cancel_noop room=%s event_id=%s", room_id, event.event_id)
         await post_message(
@@ -809,19 +828,19 @@ async def handle_event(
                         reply_to=ack_event_id or event.event_id,
                     )
                     return
-            touch_session(db, thread_root_id)
-            log.info(
-                "action=resume_complete room=%s session=%s exit_code=%d",
-                room_id, session_id, exit_code,
-            )
-            await _post_response(
-                client, room_id, output, exit_code, session_id,
-                mention_user, max_message_length,
-                reply_target=ack_event_id or event.event_id,
-                action="resume",
-                db=db,
-                thread_root_id=thread_root_id,
-            )
+                touch_session(db, thread_root_id)
+                log.info(
+                    "action=resume_complete room=%s session=%s exit_code=%d",
+                    room_id, session_id, exit_code,
+                )
+                await _post_response(
+                    client, room_id, output, exit_code, session_id,
+                    mention_user, max_message_length,
+                    reply_target=ack_event_id or event.event_id,
+                    action="resume",
+                    db=db,
+                    thread_root_id=thread_root_id,
+                )
             return
         # Orphaned reply (session unknown — maybe started before dispatcher)
         log.info(
@@ -830,46 +849,48 @@ async def handle_event(
         )
 
     # Room-root (or orphaned reply) → spawn new session.
-    # Rate-limit applies to spawns only — runaway-loop guard, not user friction.
-    now = time.time()
-    last = _last_spawn_at.get(room_id, 0.0)
-    if now - last < RATE_LIMIT_SECONDS:
-        remaining = int(RATE_LIMIT_SECONDS - (now - last))
-        log.info(
-            "action=rate_limited room=%s event_id=%s remaining=%d",
-            room_id, event.event_id, remaining,
-        )
-        await post_message(
-            client, room_id,
-            f"{mention_user} Rate-limited; try again in {remaining}s.",
-            reply_to=event.event_id,
-        )
-        return
-    _last_spawn_at[room_id] = now
-
-    session_id = str(uuid.uuid4())
-    short_id = session_id[:8]
-    log.info(
-        "action=spawn_start room=%s event_id=%s agent=%s session=%s",
-        room_id, event.event_id, agent_name, session_id,
-    )
-    ack_event_id = await post_message(
-        client, room_id, f"Working... (session {short_id})", reply_to=event.event_id,
-    )
-    # Store session before spawning so thread replies can resume it even if spawn errors
-    insert_session(db, event.event_id, room_id, agent_name, session_id)
-    register_alias(db, ack_event_id, event.event_id)
-
-    # The dispatcher owns all Matrix posting. Agents must NOT call any Matrix
-    # or mcp__matrix__ tools — doing so causes double-posts and permission blocks.
-    prompt = (
-        f"[Invoked via Matrix room #{agent_name} by @ted. "
-        f"Output your response as plain text only. "
-        f"Do NOT use mcp__matrix__ tools or any Matrix MCP — "
-        f"the dispatcher will post your stdout to the room automatically.]\n\n"
-        f"{user_message}"
-    )
+    # Acquire lock first so rate-limit + spawn are atomic per room — with
+    # concurrent handlers, two messages racing the rate-limit check would
+    # otherwise both pass.
     async with _room_lock(room_id):
+        now = time.time()
+        last = _last_spawn_at.get(room_id, 0.0)
+        if now - last < RATE_LIMIT_SECONDS:
+            remaining = int(RATE_LIMIT_SECONDS - (now - last))
+            log.info(
+                "action=rate_limited room=%s event_id=%s remaining=%d",
+                room_id, event.event_id, remaining,
+            )
+            await post_message(
+                client, room_id,
+                f"{mention_user} Rate-limited; try again in {remaining}s.",
+                reply_to=event.event_id,
+            )
+            return
+        _last_spawn_at[room_id] = now
+
+        session_id = str(uuid.uuid4())
+        short_id = session_id[:8]
+        log.info(
+            "action=spawn_start room=%s event_id=%s agent=%s session=%s",
+            room_id, event.event_id, agent_name, session_id,
+        )
+        ack_event_id = await post_message(
+            client, room_id, f"Working... (session {short_id})", reply_to=event.event_id,
+        )
+        # Store session before spawning so thread replies can resume it even if spawn errors
+        insert_session(db, event.event_id, room_id, agent_name, session_id)
+        register_alias(db, ack_event_id, event.event_id)
+
+        # The dispatcher owns all Matrix posting. Agents must NOT call any Matrix
+        # or mcp__matrix__ tools — doing so causes double-posts and permission blocks.
+        prompt = (
+            f"[Invoked via Matrix room #{agent_name} by @ted. "
+            f"Output your response as plain text only. "
+            f"Do NOT use mcp__matrix__ tools or any Matrix MCP — "
+            f"the dispatcher will post your stdout to the room automatically.]\n\n"
+            f"{user_message}"
+        )
         try:
             exit_code, output = await spawn_claude(
                 session_id, prompt, project_dir, agent_name, room_id,
@@ -882,18 +903,18 @@ async def handle_event(
                 reply_to=ack_event_id or event.event_id,
             )
             return
-    log.info(
-        "action=spawn_complete room=%s session=%s exit_code=%d",
-        room_id, session_id, exit_code,
-    )
-    await _post_response(
-        client, room_id, output, exit_code, session_id,
-        mention_user, max_message_length,
-        reply_target=ack_event_id or event.event_id,
-        action="spawn",
-        db=db,
-        thread_root_id=event.event_id,
-    )
+        log.info(
+            "action=spawn_complete room=%s session=%s exit_code=%d",
+            room_id, session_id, exit_code,
+        )
+        await _post_response(
+            client, room_id, output, exit_code, session_id,
+            mention_user, max_message_length,
+            reply_target=ack_event_id or event.event_id,
+            action="spawn",
+            db=db,
+            thread_root_id=event.event_id,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -951,7 +972,11 @@ async def poll_loop(client: AsyncClient, config: dict, db: sqlite3.Connection) -
                 for event in room_info.timeline.events:
                     if not isinstance(event, RoomMessageText):
                         continue
-                    await handle_event(
+                    # Dispatch as a task so the poll loop keeps reading sync
+                    # responses while subprocesses run. Per-room serialization
+                    # is provided by _room_lock inside handle_event. This is
+                    # what allows !cancel to actually fire mid-spawn.
+                    task = asyncio.create_task(handle_event(
                         client=client,
                         room_id=room_id,
                         event=event,
@@ -961,7 +986,9 @@ async def poll_loop(client: AsyncClient, config: dict, db: sqlite3.Connection) -
                         agent_name=agent_name,
                         project_dir=project_dir,
                         db=db,
-                    )
+                    ))
+                    _handlers.add(task)
+                    task.add_done_callback(_handlers.discard)
 
         except asyncio.CancelledError:
             raise
@@ -1013,6 +1040,23 @@ async def main() -> None:
             await cleanup_task
         except (asyncio.CancelledError, Exception):
             pass
+        # Send SIGTERM to any active subprocesses so handlers can complete
+        # naturally instead of leaving orphans.
+        for room_id, proc in list(_active_processes.items()):
+            try:
+                proc.send_signal(signal.SIGTERM)
+                log.info("action=shutdown_sigterm room=%s pid=%s", room_id, proc.pid)
+            except ProcessLookupError:
+                pass
+        # Brief grace period for in-flight handlers to finish posting their
+        # responses. After 10s, abandon — PM2 will force-kill us soon anyway.
+        if _handlers:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*_handlers, return_exceptions=True), timeout=10,
+                )
+            except asyncio.TimeoutError:
+                log.warning("action=shutdown_handlers_timeout outstanding=%d", len(_handlers))
         db.close()
         await client.close()
 

@@ -1,20 +1,38 @@
 # matrix-dispatcher
 
-A PM2 daemon that watches each agent's Matrix room for messages from a trusted sender, spawns fresh `claude -p` sessions for room-root messages, and posts the response back. Reply inside a thread to resume the same session (v2+).
+A PM2 daemon that watches each agent's Matrix room for messages from a trusted sender, spawns or resumes `claude -p` sessions, and posts the response back. Send a message to the room → the agent replies. Reply inside a thread → the same session resumes. Bang-prefix commands provide session management without spawning anything.
 
 ## How it works
 
 ```
-@ted sends message to #research
+@you sends message to #research
         ↓
-Dispatcher (PM2, polls every 5s)
-        ↓ room-root message → spawn
-claude -p --session-id <uuid> "<prompt>"
-        ↓ stdout
-Dispatcher posts response to Matrix room
+matrix-dispatcher (PM2, polls every 5s)
+        ↓  room-root message  → spawn new session
+        ↓  thread reply       → resume prior session via --resume <session_id>
+        ↓  !<command>         → intercepted (no spawn)
+asyncio.create_subprocess_exec("claude", "-p", "--session-id", uuid, prompt, ...)
+  cwd: <project_dir>
+        ↓  stdout
+Dispatcher posts response back to the Matrix room
+  (with @you mention so Element fires a push notification)
 ```
 
-**Routing:** Room-root messages spawn a new session. Thread replies resume (v2+, requires SQLite).
+**Routing discriminator:** Matrix thread structure only — room-root spawns, thread reply resumes. No timers, no AI judgment about intent.
+
+**Element reply quirk:** Element sometimes uses `m.in_reply_to` instead of the spec-correct `rel_type=m.thread`. The `event_aliases` table maps acknowledgment and response chunk event IDs back to their parent session, so a reply to any of those events still resolves to the right session.
+
+## Commands
+
+Commands use the `!` prefix because Element intercepts `/`-prefixed messages client-side as IRC commands (`/me`, `/join`, `/help`) and never sends them to Matrix.
+
+| Command | What it does |
+|---------|-------------|
+| `!help` | List of dispatcher commands |
+| `!sessions` | 10 most recent sessions in the room as numbered items; reply-in-thread to resume |
+| `!recap [N]` | Last N user+assistant turns from the most recent session (default 5, cap 20). Read-only — no spawn, no resume registered |
+| `!mirror` | Register the most recent untracked JSONL session in `project_dir` under a new thread root, so a CloudCLI-started session can be resumed via Matrix replies |
+| `!cancel` | Send SIGTERM to the active subprocess in this room and confirm |
 
 ## Requirements
 
@@ -53,14 +71,19 @@ trusted_sender: "@you:your-homeserver.com"
 mention_user: "@you:your-homeserver.com"
 poll_interval_seconds: 5
 max_message_length: 4000
+session_retention_days: 30
+startup_notification_agent: research    # room to post on dispatcher launch
 
 agents:
   research:
     room_id: "!roomid:your-homeserver.com"
     project_dir: "/home/user/.claude/projects/research"
+  dev:
+    room_id: "!roomid:your-homeserver.com"
+    project_dir: "/home/user/.claude/projects/dev"
 ```
 
-`project_dir` is the working directory passed to `claude -p` — the project's CLAUDE.md must be present there.
+`project_dir` is the working directory passed to `claude -p` — the project's `CLAUDE.md` must be present there.
 
 ### 4. Register with PM2
 
@@ -69,21 +92,40 @@ pm2 start ecosystem.config.js
 pm2 save
 ```
 
-## Security notes
+Logs land at `~/.pm2/logs/matrix-dispatcher-out.log` and `~/.pm2/logs/matrix-dispatcher-error.log`.
 
-- Only messages from `trusted_sender` are processed — all others are silently discarded.
-- Subprocess env is a minimal allowlist; dispatcher credentials do not flow into agent processes.
-- Log files contain event IDs, session IDs, and exit codes only — no message body content.
+## SQLite session store
+
+State lives at `~/.claude/data/matrix-dispatcher/sessions.db` (WAL mode). Three tables:
+
+| Table | Purpose |
+|-------|---------|
+| `sessions` | One row per spawned session — `thread_root_id`, `room_id`, `agent`, `session_id`, `created_at`, `last_used_at` |
+| `event_aliases` | Maps ack and response chunk event IDs back to their parent session (handles Element's `m.in_reply_to` reply format) |
+| `poll_state` | Per-room Matrix sync tokens — survives restarts, no message replay |
+
+Sessions older than `session_retention_days` (default 30) and orphaned `event_aliases` rows are deleted by `cleanup_loop()` at startup and every 24 hours. Manual cleanup: `python dispatcher.py --cleanup`.
+
+## Security
+
+- Only messages from `trusted_sender` are processed — all others are silently discarded. Applies to spawns, resumes, and all dispatcher commands.
+- Subprocess env is a minimal allowlist (`HOME`, `PATH`, `AGENT_ID`, `AGENT_TYPE`, plus required `CLAUDE_*` vars). Dispatcher credentials do not flow into agent processes.
+- Log files contain timestamps, event IDs, session IDs, room IDs, actions, and exit codes only — no message body content.
+- All SQLite queries are parameterized — no f-string SQL construction anywhere in the dispatcher.
+- `sessions.db` is created with mode 600.
+- JSONL stems are validated with `uuid.UUID()` before being passed to `--resume` argv.
 - `requirements.txt` pins exact versions.
 
 ## Phases
 
 | Phase | Status | Description |
 |-------|--------|-------------|
-| v1 | ✓ deployed | Spawn-only loop, acknowledgment message, @mention, response chunking |
-| v2 | planned | SQLite + thread-based resume, restart-safe |
-| v3 | planned | `/sessions`, `/recap`, `/mirror`, `/help` commands, nightly cleanup |
-| Phase 4 | planned | Concurrency lock, timeout, rate limiting, `/cancel`, error surfacing |
+| v0.1 | shipped | Spawn-only loop, acknowledgment message, @mention, response chunking |
+| v0.2 | shipped | SQLite session store, thread-based resume, `event_aliases` for Element reply quirk |
+| v0.3 | shipped | `!sessions`, `!recap`, `!mirror`, `!help`; 30-day retention cleanup |
+| v0.4 | shipped | Async subprocess, per-room concurrency lock, per-room rate limit, `!cancel`, startup notification |
+
+See [CHANGELOG.md](CHANGELOG.md) for per-phase detail.
 
 ## Files
 
@@ -97,6 +139,11 @@ matrix-dispatcher/
 ├── start.sh            # sources credentials env file, execs dispatcher
 └── venv/               # local venv
 ~/.claude/data/matrix-dispatcher/
-└── sessions.db         # SQLite (v2+, created at first run)
-~/.claude/data/matrix-dispatcher/poll-tokens.json  # per-run sync token (v1)
+└── sessions.db         # SQLite (sessions, event_aliases, poll_state)
+~/.claude-secrets/
+└── matrix-dispatcher.env   # bot credentials (chmod 600)
 ```
+
+## License
+
+MIT — see [LICENSE](LICENSE).

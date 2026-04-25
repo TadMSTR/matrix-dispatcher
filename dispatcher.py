@@ -79,6 +79,14 @@ def init_db(db: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_last_used ON sessions(last_used_at);
 
+        -- Maps any dispatcher-posted event_id (ack, response chunks) back to a session,
+        -- so that replies to those events resolve to the right session even when Element
+        -- sends m.in_reply_to rather than rel_type=m.thread.
+        CREATE TABLE IF NOT EXISTS event_aliases (
+          event_id       TEXT PRIMARY KEY,
+          thread_root_id TEXT NOT NULL REFERENCES sessions(thread_root_id)
+        );
+
         CREATE TABLE IF NOT EXISTS poll_state (
           room_id    TEXT PRIMARY KEY,
           since      TEXT NOT NULL,
@@ -127,6 +135,34 @@ def get_session(db: sqlite3.Connection, thread_root_id: str) -> sqlite3.Row | No
     return db.execute(
         "SELECT * FROM sessions WHERE thread_root_id = ?", (thread_root_id,)
     ).fetchone()
+
+
+def get_session_by_event(db: sqlite3.Connection, event_id: str) -> sqlite3.Row | None:
+    """Look up a session by any related event ID (thread root, ack, or response chunk)."""
+    row = db.execute(
+        "SELECT * FROM sessions WHERE thread_root_id = ?", (event_id,)
+    ).fetchone()
+    if row:
+        return row
+    alias = db.execute(
+        "SELECT thread_root_id FROM event_aliases WHERE event_id = ?", (event_id,)
+    ).fetchone()
+    if alias:
+        return db.execute(
+            "SELECT * FROM sessions WHERE thread_root_id = ?", (alias["thread_root_id"],)
+        ).fetchone()
+    return None
+
+
+def register_alias(db: sqlite3.Connection, event_id: str, thread_root_id: str) -> None:
+    """Register a dispatcher-posted event_id so replies to it resolve to the right session."""
+    if not event_id:
+        return
+    db.execute(
+        "INSERT OR IGNORE INTO event_aliases (event_id, thread_root_id) VALUES (?, ?)",
+        (event_id, thread_root_id),
+    )
+    db.commit()
 
 
 def insert_session(
@@ -315,21 +351,25 @@ async def _post_response(
     max_message_length: int,
     reply_target: str,
     action: str,
+    db: sqlite3.Connection,
+    thread_root_id: str,
 ) -> None:
     short_id = session_id[:8]
     if exit_code != 0:
-        await post_message(
+        event_id = await post_message(
             client, room_id,
             f"{mention_user} Session {short_id} {action} error:\n\n{output}",
             reply_to=reply_target,
         )
+        register_alias(db, event_id, thread_root_id)
         return
     if not output:
         output = "(no output)"
     chunks = split_on_paragraphs(output, max_message_length)
     for i, chunk in enumerate(chunks):
         text = f"{mention_user} {chunk}" if i == 0 else chunk
-        await post_message(client, room_id, text, reply_to=reply_target)
+        event_id = await post_message(client, room_id, text, reply_to=reply_target)
+        register_alias(db, event_id, thread_root_id)
 
 
 async def handle_event(
@@ -360,9 +400,10 @@ async def handle_event(
 
     # Thread reply → attempt resume
     if thread_root is not None:
-        row = get_session(db, thread_root)
+        row = get_session_by_event(db, thread_root)
         if row is not None:
             session_id = row["session_id"]
+            thread_root_id = row["thread_root_id"]
             short_id = session_id[:8]
             log.info(
                 "action=resume_start room=%s event_id=%s agent=%s session=%s",
@@ -372,6 +413,7 @@ async def handle_event(
                 client, room_id, f"Resuming... (session {short_id})",
                 reply_to=event.event_id,
             )
+            register_alias(db, ack_event_id, thread_root_id)
             try:
                 exit_code, output = resume_claude(session_id, user_message, project_dir, agent_name)
             except subprocess.TimeoutExpired:
@@ -382,7 +424,7 @@ async def handle_event(
                     reply_to=ack_event_id or event.event_id,
                 )
                 return
-            touch_session(db, thread_root)
+            touch_session(db, thread_root_id)
             log.info(
                 "action=resume_complete room=%s session=%s exit_code=%d",
                 room_id, session_id, exit_code,
@@ -392,6 +434,8 @@ async def handle_event(
                 mention_user, max_message_length,
                 reply_target=ack_event_id or event.event_id,
                 action="resume",
+                db=db,
+                thread_root_id=thread_root_id,
             )
             return
         # Orphaned reply (session unknown — maybe started before dispatcher)
@@ -412,6 +456,7 @@ async def handle_event(
     )
     # Store session before spawning so thread replies can resume it even if spawn errors
     insert_session(db, event.event_id, room_id, agent_name, session_id)
+    register_alias(db, ack_event_id, event.event_id)
 
     prompt = f"[Invoked via Matrix room #{agent_name} by @ted]\n\n{user_message}"
     try:
@@ -433,6 +478,8 @@ async def handle_event(
         mention_user, max_message_length,
         reply_target=ack_event_id or event.event_id,
         action="spawn",
+        db=db,
+        thread_root_id=event.event_id,
     )
 
 

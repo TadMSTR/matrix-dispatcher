@@ -922,8 +922,8 @@ async def handle_event(
 # ---------------------------------------------------------------------------
 
 async def poll_loop(client: AsyncClient, config: dict, db: sqlite3.Connection) -> None:
-    trusted_sender: str = config.get("trusted_sender", "@ted:claudebox.me")
-    mention_user: str = config.get("mention_user", "@ted:claudebox.me")
+    trusted_sender: str = config.get("trusted_sender", "")
+    mention_user: str = config.get("mention_user", "")
     poll_interval: int = config.get("poll_interval_seconds", 5)
     max_message_length: int = config.get("max_message_length", 4000)
 

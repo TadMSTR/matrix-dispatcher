@@ -8,6 +8,8 @@ agents:
   research:
     room_id: "!roomid:your.homeserver"
     project_dir: "/home/user/.claude/projects/research"
+    subprocess_timeout_seconds: 1800  # optional, default 300
   dev:
     room_id: "!roomid:your.homeserver"
     project_dir: "/home/user/.claude/projects/dev"
+    subprocess_timeout_seconds: 1800  # optional, default 300

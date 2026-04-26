@@ -324,6 +324,7 @@ async def _run_claude(
     project_dir: str,
     agent_name: str,
     room_id: str,
+    timeout: int = SUBPROCESS_TIMEOUT_SECONDS,
 ) -> tuple[int, str]:
     """Run claude with the given args, registering the process for /cancel.
 
@@ -339,7 +340,7 @@ async def _run_claude(
     _active_processes[room_id] = proc
     try:
         stdout_b, stderr_b = await asyncio.wait_for(
-            proc.communicate(), timeout=SUBPROCESS_TIMEOUT_SECONDS,
+            proc.communicate(), timeout=timeout,
         )
     except asyncio.TimeoutError:
         proc.kill()
@@ -368,10 +369,11 @@ async def spawn_claude(
     project_dir: str,
     agent_name: str,
     room_id: str,
+    timeout: int = SUBPROCESS_TIMEOUT_SECONDS,
 ) -> tuple[int, str]:
     return await _run_claude(
         ["claude", "-p", "--session-id", session_id, prompt],
-        project_dir, agent_name, room_id,
+        project_dir, agent_name, room_id, timeout=timeout,
     )
 
 
@@ -381,10 +383,11 @@ async def resume_claude(
     project_dir: str,
     agent_name: str,
     room_id: str,
+    timeout: int = SUBPROCESS_TIMEOUT_SECONDS,
 ) -> tuple[int, str]:
     return await _run_claude(
         ["claude", "-p", "--resume", session_id, message],
-        project_dir, agent_name, room_id,
+        project_dir, agent_name, room_id, timeout=timeout,
     )
 
 
@@ -754,6 +757,7 @@ async def handle_event(
     agent_name: str,
     project_dir: str,
     db: sqlite3.Connection,
+    subprocess_timeout_seconds: int = SUBPROCESS_TIMEOUT_SECONDS,
 ) -> None:
     # Security flag B: sender gate — first check, silently discard non-trusted
     if event.sender != trusted_sender:
@@ -819,14 +823,16 @@ async def handle_event(
                 try:
                     exit_code, output = await resume_claude(
                         session_id, user_message, project_dir, agent_name, room_id,
+                        timeout=subprocess_timeout_seconds,
                     )
                 except asyncio.TimeoutError:
                     log.error("action=resume_timeout room=%s session=%s", room_id, session_id)
-                    await post_message(
+                    timeout_event_id = await post_message(
                         client, room_id,
-                        f"{mention_user} Session {short_id} timed out after 300s.",
+                        f"{mention_user} Session {short_id} timed out after {subprocess_timeout_seconds}s.",
                         reply_to=ack_event_id or event.event_id,
                     )
+                    register_alias(db, timeout_event_id, thread_root_id)
                     return
                 touch_session(db, thread_root_id)
                 log.info(
@@ -894,14 +900,16 @@ async def handle_event(
         try:
             exit_code, output = await spawn_claude(
                 session_id, prompt, project_dir, agent_name, room_id,
+                timeout=subprocess_timeout_seconds,
             )
         except asyncio.TimeoutError:
             log.error("action=spawn_timeout room=%s session=%s", room_id, session_id)
-            await post_message(
+            timeout_event_id = await post_message(
                 client, room_id,
-                f"{mention_user} Session {short_id} timed out after 300s.",
+                f"{mention_user} Session {short_id} timed out after {subprocess_timeout_seconds}s.",
                 reply_to=ack_event_id or event.event_id,
             )
+            register_alias(db, timeout_event_id, event.event_id)
             return
         log.info(
             "action=spawn_complete room=%s session=%s exit_code=%d",
@@ -986,6 +994,9 @@ async def poll_loop(client: AsyncClient, config: dict, db: sqlite3.Connection) -
                         agent_name=agent_name,
                         project_dir=project_dir,
                         db=db,
+                        subprocess_timeout_seconds=agent_cfg.get(
+                            "subprocess_timeout_seconds", SUBPROCESS_TIMEOUT_SECONDS
+                        ),
                     ))
                     _handlers.add(task)
                     task.add_done_callback(_handlers.discard)

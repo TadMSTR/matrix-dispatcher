@@ -1,0 +1,26 @@
+homeserver: "https://matrix.helmforge.me"
+access_token_env: "DISPATCHER_ACCESS_TOKEN"
+bot_user_id: "@forge-sysadmin:helmforge.me"
+trusted_sender: "@ted:helmforge.me"
+mention_user: "@ted:helmforge.me"
+poll_interval_seconds: 5
+max_message_length: 4000
+session_retention_days: 30
+startup_notification_agent: sysadmin
+
+agents:
+  sysadmin:
+    room_id: "!rcRDEZtSLvYSaNSfyN:helmforge.me"
+    project_dir: "/home/ted/.claude/projects/sysadmin"
+  research:
+    room_id: "!bOwYTMTGDfEBkyirfF:helmforge.me"
+    project_dir: "/home/ted/.claude/projects/research"
+  developer:
+    room_id: "!pghxfWPgEzGExkIYvT:helmforge.me"
+    project_dir: "/home/ted/.claude/projects/developer"
+  security:
+    room_id: "!BDhaxOvxUjTypOXNPh:helmforge.me"
+    project_dir: "/home/ted/.claude/projects/security"
+  writer:
+    room_id: "!EwlcoJlSNYcWIcspwa:helmforge.me"
+    project_dir: "/home/ted/.claude/projects/writer"

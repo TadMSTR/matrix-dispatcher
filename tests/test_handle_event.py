@@ -220,6 +220,24 @@ async def test_room_get_event_failure_treated_as_foreign(db, spies, caplog):
     assert "sender=unknown" in caplog.text
 
 
+async def test_empty_bot_user_id_degrades_to_foreign(db, spies, caplog):
+    """Fail-closed: an unset/empty bot_user_id never spawns and never mislabels
+    a foreign post as 'ours' — the `if bot_user_id and ...` guard falls through
+    to the foreign/silent-ignore branch. Regression guard for that short-circuit.
+    """
+    client = FakeClient(parent_sender=FOREIGN)
+    event = make_event(TRUSTED, "approve", "$reply6", reply_to="$foreign_event")
+
+    with caplog.at_level(logging.INFO, logger="dispatcher"):
+        await _dispatch(client, event, db, bot_user_id="")
+
+    assert not spies.spawn.called
+    assert not spies.resume.called
+    assert client.sent == []  # no hint, no spawn
+    assert "action=foreign_reply_ignored" in caplog.text
+    assert "action=expired_thread_reply" not in caplog.text
+
+
 async def test_non_trusted_sender_ignored(db, spies):
     """Sender gate still discards non-trusted senders before any dispatch."""
     client = FakeClient(parent_sender=FOREIGN)

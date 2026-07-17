@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-07-17
+
 ### Fixed
 - Orphaned / foreign-bot replies no longer spawn a new session (MDISP-6). A reply
   whose thread root has no tracked session is never treated as a spawn trigger:
@@ -12,6 +14,11 @@
 ### Added
 - First automated test suite (`tests/test_handle_event.py`, `pytest` + `pytest-asyncio`)
   covering the `handle_event` dispatch outcomes; `requirements-dev.txt` for dev deps.
+
+### Security
+- Dev dependency `pytest` pinned `>=9.0.3` to clear PYSEC-2026-1845 (predictable
+  `/tmp/pytest-of-*` dir; dev-only, non-runtime). Audit LOW finding closed by adding a
+  regression test for empty/misconfigured `bot_user_id` degrading to no-spawn.
 
 ## [0.4.0] - 2026-04-25
 

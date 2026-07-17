@@ -27,10 +27,13 @@ import sqlite3
 import sys
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
 from nio import AsyncClient, RoomMessageText, SyncResponse
+
+from agent_registry import RegistryClient, get_registry
 
 # ---------------------------------------------------------------------------
 # Runtime state — per-room locks, active processes, rate-limit timestamps.
@@ -50,6 +53,15 @@ RATE_LIMIT_SECONDS = 10
 # (proc not yet registered in _active_processes).
 CANCEL_REGISTRATION_WAIT_SECONDS = 1.0
 CANCEL_POLL_INTERVAL_SECONDS = 0.05
+
+# HITL resume-on-approval (SMCP-38). The reconcile loop polls agent-postgres for
+# approval-state transitions on locally-tracked pending approvals and resumes the
+# originating session once an operator approval lands. Interval must be « the
+# scoped-mcp pre-approval token TTL (300s) so the resumed retry lands well inside
+# the token's life. Local pending rows are expired after 2× the HITL timeout
+# default (300s) so an approval that is never actioned can't accumulate.
+RECONCILE_INTERVAL_SECONDS = 10
+PENDING_APPROVAL_EXPIRY_SECONDS = 600
 
 
 def _room_lock(room_id: str) -> asyncio.Lock:
@@ -126,6 +138,21 @@ def init_db(db: sqlite3.Connection) -> None:
           room_id    TEXT PRIMARY KEY,
           since      TEXT NOT NULL,
           updated_at INTEGER NOT NULL
+        );
+
+        -- HITL resume-on-approval (SMCP-38): a gated tool call rejected during a
+        -- spawned/resumed turn is recorded here after the turn exits, correlated
+        -- to its originating session. The reconcile loop resumes that session
+        -- once agent-postgres shows the approval as 'approved'. thread_root_id
+        -- stays in the dispatcher's own SQLite by design (no agent-postgres
+        -- schema change). tool_name is carried for an informative resume nudge.
+        CREATE TABLE IF NOT EXISTS pending_approvals (
+          approval_id    TEXT PRIMARY KEY,
+          thread_root_id TEXT NOT NULL,
+          session_id     TEXT NOT NULL,
+          room_id        TEXT NOT NULL,
+          tool_name      TEXT NOT NULL DEFAULT '',
+          created_at     INTEGER NOT NULL
         );
     """)
     db.commit()
@@ -222,6 +249,37 @@ def touch_session(db: sqlite3.Connection, thread_root_id: str) -> None:
         "UPDATE sessions SET last_used_at = ? WHERE thread_root_id = ?",
         (int(time.time()), thread_root_id),
     )
+    db.commit()
+
+
+# ---------------------------------------------------------------------------
+# HITL pending-approval store (SMCP-38) — local mapping approval → session.
+# ---------------------------------------------------------------------------
+
+def insert_pending_approval(
+    db: sqlite3.Connection,
+    approval_id: str,
+    thread_root_id: str,
+    session_id: str,
+    room_id: str,
+    tool_name: str,
+) -> None:
+    """Record a pending approval to reconcile. Idempotent on approval_id."""
+    db.execute(
+        """INSERT OR REPLACE INTO pending_approvals
+           (approval_id, thread_root_id, session_id, room_id, tool_name, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (approval_id, thread_root_id, session_id, room_id, tool_name, int(time.time())),
+    )
+    db.commit()
+
+
+def get_pending_approvals(db: sqlite3.Connection) -> list[sqlite3.Row]:
+    return db.execute("SELECT * FROM pending_approvals").fetchall()
+
+
+def delete_pending_approval(db: sqlite3.Connection, approval_id: str) -> None:
+    db.execute("DELETE FROM pending_approvals WHERE approval_id = ?", (approval_id,))
     db.commit()
 
 
@@ -410,6 +468,70 @@ async def resume_claude(
     return await _run_claude(
         ["claude", "-p", "--resume", session_id, message],
         project_dir, agent_name, room_id, timeout=timeout,
+    )
+
+
+# ---------------------------------------------------------------------------
+# HITL resume-on-approval (SMCP-38) — session registry write + pending detect.
+# Both helpers are no-ops when the registry is disabled/absent (fail-open): a
+# down agent-postgres must never affect the spawn/resume path.
+# ---------------------------------------------------------------------------
+
+async def _register_session(
+    registry: RegistryClient | None,
+    session_id: str,
+    agent_name: str,
+    room_id: str,
+    project_dir: str,
+    scoped_mcp_url: str,
+) -> None:
+    """Best-effort upsert of the agent-postgres ``sessions`` row for this turn.
+
+    Writing this before the turn makes ``hitl_approvals.session_id`` FK-safe at
+    :meth:`RegistryClient.link_session` time. ``agent_name`` is the ``agent_id``
+    in agent-postgres — the dispatcher passes it to the subprocess as ``AGENT_ID``,
+    so it equals the ``{agent_id}`` prefix of any ``approval_id`` scoped-mcp mints.
+    """
+    if registry is None or not registry.enabled:
+        return
+    await registry.upsert_session(
+        session_id=session_id,
+        agent_id=agent_name,
+        transport="matrix",
+        room_id=room_id,
+        project_dir=project_dir,
+        scoped_mcp_url=scoped_mcp_url or None,
+    )
+
+
+async def _record_pending_if_gated(
+    db: sqlite3.Connection,
+    registry: RegistryClient | None,
+    agent_name: str,
+    room_id: str,
+    session_id: str,
+    thread_root_id: str,
+    turn_start: datetime,
+) -> None:
+    """After a turn exits, correlate any still-pending HITL approval to it.
+
+    Only approvals still ``pending`` at this point are tracked — an approval the
+    agent self-resolved in-turn is excluded by :meth:`find_pending_approval`, so
+    a later reconcile can never re-execute a tool call that already ran (the
+    mandatory duplicate-execution guard).
+    """
+    if registry is None or not registry.enabled:
+        return
+    pending = await registry.find_pending_approval(agent_name, turn_start)
+    if pending is None:
+        return
+    approval_id = pending["approval_id"]
+    tool_name = pending.get("tool_name") or ""
+    insert_pending_approval(db, approval_id, thread_root_id, session_id, room_id, tool_name)
+    await registry.link_session(approval_id, session_id)
+    log.info(
+        "action=hitl_pending_detected room=%s session=%s approval=%s tool=%s",
+        room_id, session_id, approval_id, tool_name,
     )
 
 
@@ -719,6 +841,7 @@ async def handle_recap_command(
 async def handle_mirror_command(
     client: AsyncClient, room_id: str, event: RoomMessageText, mention_user: str,
     agent_name: str, project_dir: str, db: sqlite3.Connection,
+    registry: RegistryClient | None = None, scoped_mcp_url: str = "",
 ) -> None:
     log.info("action=cmd_mirror room=%s event_id=%s", room_id, event.event_id)
     session_id = find_unmirrored_session_id(db, project_dir, room_id)
@@ -730,6 +853,9 @@ async def handle_mirror_command(
         )
         return
     insert_session(db, event.event_id, room_id, agent_name, session_id)
+    await _register_session(
+        registry, session_id, agent_name, room_id, project_dir, scoped_mcp_url,
+    )
     response_event_id = await post_message(
         client, room_id,
         f"{mention_user} Linked session {session_id[:8]} to this thread. "
@@ -769,6 +895,201 @@ async def cleanup_loop(db: sqlite3.Connection, retention_days: int) -> None:
         await asyncio.sleep(86400)
 
 
+# ---------------------------------------------------------------------------
+# HITL resume-on-approval reconcile loop (SMCP-38)
+# ---------------------------------------------------------------------------
+
+def _build_room_to_agent(config: dict) -> dict[str, dict]:
+    """Map room_id → agent config (name + agent fields), as poll_loop does."""
+    room_to_agent: dict[str, dict] = {}
+    for name, agent_cfg in config.get("agents", {}).items():
+        room_to_agent[agent_cfg["room_id"]] = {"name": name, **agent_cfg}
+    return room_to_agent
+
+
+async def _resume_on_approval(
+    client: AsyncClient,
+    db: sqlite3.Connection,
+    config: dict,
+    room_to_agent: dict[str, dict],
+    registry: RegistryClient | None,
+    row: sqlite3.Row,
+) -> None:
+    """Resume the originating session for one approved approval — exactly once.
+
+    The local pending row is deleted *before* the resume (claim-then-act) so an
+    overlapping reconcile pass or a restart mid-resume can never fire it twice.
+    A failed resume degrades to the operator's manual retry (fail-open), which is
+    the safe direction: a missed auto-resume beats a duplicate tool execution.
+    Runs under the per-room lock so it never interleaves with a live turn.
+    """
+    approval_id = row["approval_id"]
+    room_id = row["room_id"]
+    session_id = row["session_id"]
+    thread_root_id = row["thread_root_id"]
+    tool_name = row["tool_name"] or ""
+    mention_user = config.get("mention_user", "")
+    max_message_length = config.get("max_message_length", 4000)
+
+    agent_cfg = room_to_agent.get(room_id)
+    if agent_cfg is None:
+        # Room no longer configured — nothing to resume into. Drop the record.
+        delete_pending_approval(db, approval_id)
+        log.warning(
+            "action=hitl_resume_no_agent room=%s approval=%s", room_id, approval_id,
+        )
+        return
+    agent_name = agent_cfg["name"]
+    project_dir = agent_cfg["project_dir"]
+    timeout = agent_cfg.get("subprocess_timeout_seconds", SUBPROCESS_TIMEOUT_SECONDS)
+    scoped_mcp_url = agent_cfg.get("scoped_mcp_url", "")
+
+    # Claim first — exactly-once guarantee.
+    delete_pending_approval(db, approval_id)
+
+    # The nudge carries NO secret (no OTP, no token). The agent must retry the
+    # identical call — the pre-approval token is bound to (tool, args_hash).
+    nudge = (
+        f"Operator approved your pending request for `{tool_name}` "
+        f"(approval {approval_id}). Retry the exact same tool call now — "
+        f"same arguments — to consume the approval."
+    )
+    log.info(
+        "action=hitl_resume_start room=%s session=%s approval=%s",
+        room_id, session_id, approval_id,
+    )
+    async with _room_lock(room_id):
+        turn_start = datetime.now(timezone.utc)
+        try:
+            exit_code, output = await resume_claude(
+                session_id, nudge, project_dir, agent_name, room_id, timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            log.error(
+                "action=hitl_resume_timeout room=%s session=%s approval=%s",
+                room_id, session_id, approval_id,
+            )
+            evt = await post_message(
+                client, room_id,
+                f"{mention_user} Session {session_id[:8]} timed out resuming after approval.",
+                reply_to=thread_root_id,
+            )
+            register_alias(db, evt, thread_root_id)
+            return
+        except Exception:
+            # The row was already claimed (deleted) for the exactly-once guarantee,
+            # so a non-timeout failure here would otherwise drop the approval
+            # silently. Notify the operator so they can retry manually — symmetric
+            # with the timeout path (audit LOW-1).
+            log.exception(
+                "action=hitl_resume_failed room=%s session=%s approval=%s",
+                room_id, session_id, approval_id,
+            )
+            evt = await post_message(
+                client, room_id,
+                f"{mention_user} Session {session_id[:8]} failed to resume after approval "
+                f"(approval {approval_id}); please retry the request manually.",
+                reply_to=thread_root_id,
+            )
+            register_alias(db, evt, thread_root_id)
+            return
+        touch_session(db, thread_root_id)
+        log.info(
+            "action=hitl_resume_complete room=%s session=%s approval=%s exit_code=%d",
+            room_id, session_id, approval_id, exit_code,
+        )
+        await _post_response(
+            client, room_id, output, exit_code, session_id,
+            mention_user, max_message_length,
+            reply_target=thread_root_id,
+            action="resume",
+            db=db,
+            thread_root_id=thread_root_id,
+        )
+        # A resumed-after-approval turn may itself hit another gate — track it too.
+        await _record_pending_if_gated(
+            db, registry, agent_name, room_id, session_id, thread_root_id, turn_start,
+        )
+
+
+async def reconcile_once(
+    client: AsyncClient,
+    db: sqlite3.Connection,
+    config: dict,
+    room_to_agent: dict[str, dict],
+    registry: RegistryClient | None,
+) -> None:
+    """One reconcile pass: expire stale locals, then resume/deny by DB state."""
+    if registry is None or not registry.enabled:
+        return
+    pending = get_pending_approvals(db)
+    if not pending:
+        return
+    mention_user = config.get("mention_user", "")
+    now = int(time.time())
+
+    # Expire local rows for approvals never actioned within the window.
+    live: list[sqlite3.Row] = []
+    for row in pending:
+        if now - row["created_at"] > PENDING_APPROVAL_EXPIRY_SECONDS:
+            delete_pending_approval(db, row["approval_id"])
+            log.info(
+                "action=hitl_pending_expired room=%s approval=%s",
+                row["room_id"], row["approval_id"],
+            )
+        else:
+            live.append(row)
+    if not live:
+        return
+
+    states = await registry.get_approval_states([r["approval_id"] for r in live])
+    for row in live:
+        state = states.get(row["approval_id"])
+        if state == "approved":
+            await _resume_on_approval(client, db, config, room_to_agent, registry, row)
+        elif state == "denied":
+            delete_pending_approval(db, row["approval_id"])
+            log.info(
+                "action=hitl_denied_noresume room=%s approval=%s",
+                row["room_id"], row["approval_id"],
+            )
+            evt = await post_message(
+                client, row["room_id"],
+                f"{mention_user} Operator denied the pending request for "
+                f"`{row['tool_name'] or 'the tool'}`; not retrying.",
+                reply_to=row["thread_root_id"],
+            )
+            register_alias(db, evt, row["thread_root_id"])
+        # else: still 'pending' (or absent) — leave for a later pass.
+
+
+async def reconcile_loop(
+    client: AsyncClient,
+    config: dict,
+    db: sqlite3.Connection,
+    registry: RegistryClient | None,
+) -> None:
+    """Periodically resume sessions whose HITL approvals have landed (SMCP-38).
+
+    No-ops entirely when the registry is disabled (``AGENT_REGISTRY_DSN`` unset),
+    so with the feature off the dispatcher behaves exactly as before. Never lets a
+    registry error escape into the process — a failed pass is logged and retried.
+    """
+    if registry is None or not registry.enabled:
+        log.info("action=reconcile_disabled reason=registry-off")
+        return
+    room_to_agent = _build_room_to_agent(config)
+    log.info("action=reconcile_start interval=%d", RECONCILE_INTERVAL_SECONDS)
+    while True:
+        try:
+            await reconcile_once(client, db, config, room_to_agent, registry)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("action=reconcile_error")
+        await asyncio.sleep(RECONCILE_INTERVAL_SECONDS)
+
+
 async def handle_event(
     client: AsyncClient,
     room_id: str,
@@ -781,6 +1102,8 @@ async def handle_event(
     db: sqlite3.Connection,
     bot_user_id: str = "",
     subprocess_timeout_seconds: int = SUBPROCESS_TIMEOUT_SECONDS,
+    registry: RegistryClient | None = None,
+    scoped_mcp_url: str = "",
 ) -> None:
     # Security flag B: sender gate — first check, silently discard non-trusted
     if event.sender != trusted_sender:
@@ -811,6 +1134,7 @@ async def handle_event(
         elif cmd == "!mirror":
             await handle_mirror_command(
                 client, room_id, event, mention_user, agent_name, project_dir, db,
+                registry=registry, scoped_mcp_url=scoped_mcp_url,
             )
         elif cmd == "!cancel":
             await handle_cancel_command(client, room_id, event, mention_user)
@@ -842,7 +1166,11 @@ async def handle_event(
                 reply_to=event.event_id,
             )
             register_alias(db, ack_event_id, thread_root_id)
+            await _register_session(
+                registry, session_id, agent_name, room_id, project_dir, scoped_mcp_url,
+            )
             async with _room_lock(room_id):
+                turn_start = datetime.now(timezone.utc)
                 try:
                     exit_code, output = await resume_claude(
                         session_id, user_message, project_dir, agent_name, room_id,
@@ -869,6 +1197,9 @@ async def handle_event(
                     action="resume",
                     db=db,
                     thread_root_id=thread_root_id,
+                )
+                await _record_pending_if_gated(
+                    db, registry, agent_name, room_id, session_id, thread_root_id, turn_start,
                 )
             return
         # Orphaned reply: thread root has no tracked session. Never spawn a new
@@ -934,6 +1265,9 @@ async def handle_event(
         # Store session before spawning so thread replies can resume it even if spawn errors
         insert_session(db, event.event_id, room_id, agent_name, session_id)
         register_alias(db, ack_event_id, event.event_id)
+        await _register_session(
+            registry, session_id, agent_name, room_id, project_dir, scoped_mcp_url,
+        )
 
         # The dispatcher owns all Matrix posting. Agents must NOT call any Matrix
         # or mcp__matrix__ tools — doing so causes double-posts and permission blocks.
@@ -944,6 +1278,7 @@ async def handle_event(
             f"the dispatcher will post your stdout to the room automatically.]\n\n"
             f"{user_message}"
         )
+        turn_start = datetime.now(timezone.utc)
         try:
             exit_code, output = await spawn_claude(
                 session_id, prompt, project_dir, agent_name, room_id,
@@ -970,13 +1305,21 @@ async def handle_event(
             db=db,
             thread_root_id=event.event_id,
         )
+        await _record_pending_if_gated(
+            db, registry, agent_name, room_id, session_id, event.event_id, turn_start,
+        )
 
 
 # ---------------------------------------------------------------------------
 # Polling loop
 # ---------------------------------------------------------------------------
 
-async def poll_loop(client: AsyncClient, config: dict, db: sqlite3.Connection) -> None:
+async def poll_loop(
+    client: AsyncClient,
+    config: dict,
+    db: sqlite3.Connection,
+    registry: RegistryClient | None = None,
+) -> None:
     trusted_sender: str = config.get("trusted_sender", "")
     mention_user: str = config.get("mention_user", "")
     bot_user_id: str = config.get("bot_user_id", "")
@@ -1046,6 +1389,8 @@ async def poll_loop(client: AsyncClient, config: dict, db: sqlite3.Connection) -
                         subprocess_timeout_seconds=agent_cfg.get(
                             "subprocess_timeout_seconds", SUBPROCESS_TIMEOUT_SECONDS
                         ),
+                        registry=registry,
+                        scoped_mcp_url=agent_cfg.get("scoped_mcp_url", ""),
                     ))
                     _handlers.add(task)
                     task.add_done_callback(_handlers.discard)
@@ -1091,15 +1436,24 @@ async def main() -> None:
         except Exception:
             log.exception("action=startup_notify_error")
 
+    # HITL resume-on-approval (SMCP-38). Disabled unless AGENT_REGISTRY_DSN is set
+    # and the pool builds — fail-open, so a down/absent agent-postgres degrades to
+    # the prior manual-retry behavior, never an outage.
+    registry = await get_registry()
+    log.info("action=registry_status enabled=%s", registry.enabled)
+
     cleanup_task = asyncio.create_task(cleanup_loop(db, retention_days))
+    reconcile_task = asyncio.create_task(reconcile_loop(client, config, db, registry))
     try:
-        await poll_loop(client, config, db)
+        await poll_loop(client, config, db, registry)
     finally:
-        cleanup_task.cancel()
-        try:
-            await cleanup_task
-        except (asyncio.CancelledError, Exception):
-            pass
+        for task in (cleanup_task, reconcile_task):
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        await registry.close()
         # Send SIGTERM to any active subprocesses so handlers can complete
         # naturally instead of leaving orphans.
         for room_id, proc in list(_active_processes.items()):

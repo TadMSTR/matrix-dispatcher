@@ -2,6 +2,43 @@
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-17
+
+### Added
+- HITL resume-on-approval (SMCP-38). The dispatcher now watches the agent-postgres
+  session registry and `claude -p --resume`s the originating session when an operator
+  approval lands, closing the last gap in the HITL flow (SMCP-14) — previously the
+  approval wrote a pre-approval token that the already-exited turn never consumed.
+  - New fail-open `agent_registry.py` asyncpg client (`upsert_session`,
+    `find_pending_approval`, `link_session`, `get_approval_states`). Disabled and
+    fully no-op unless `AGENT_REGISTRY_DSN` is set and the pool builds.
+  - New local SQLite `pending_approvals` table correlating approval → session.
+  - `sessions` registry rows written at spawn/resume/`!mirror` (finally wiring the
+    writer SMCP-14 left dangling) and `hitl_approvals.session_id` populated.
+  - Reconcile loop (10s) resumes exactly once on `approved` (claim-then-act), posts a
+    note on `denied`, and expires stale local rows after 2× the HITL timeout (600s).
+  - Duplicate-execution guard: only approvals still `pending` at post-turn detection
+    are tracked, so an approval the agent self-resolved in-turn is never re-executed.
+  - Resume is dispatcher-initiated off agent-postgres state, not a reply to a
+    foreign-bot prompt — MDISP-6 stays intact. The resume nudge carries no secret.
+
+### Changed
+- `requirements.txt` adds `asyncpg==0.31.0` (runtime dep for the registry client;
+  optional import — feature stays off when `AGENT_REGISTRY_DSN` is unset).
+
+### Fixed
+- Reconcile resume now notifies the operator on any resume failure, not just
+  timeout (audit LOW-1). Because the local `pending_approvals` row is claimed
+  before the resume for the exactly-once guarantee, a non-timeout failure (e.g.
+  a transiently missing `claude` binary) previously dropped the approval
+  silently; it now posts a "retry manually" notice symmetric with the timeout path.
+
+### Security
+- Pre-audit baseline: `.gitignore` extended to cover `.env`/`*.env` and
+  `core.*`/`*.core` (SC-02) so the new `AGENT_REGISTRY_DSN` secret can't land as a
+  stray dotenv. Audit outcome: 2 Low findings (1 fixed, 1 deferred to scoped-mcp);
+  no security bypass; all 7 scrutiny points held; 18/18 tests; pip-audit clean.
+
 ## [0.4.1] - 2026-07-17
 
 ### Fixed

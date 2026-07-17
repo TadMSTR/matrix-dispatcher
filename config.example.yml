@@ -4,11 +4,18 @@ poll_interval_seconds: 5
 max_message_length: 4000
 session_retention_days: 30
 
+# HITL resume-on-approval (SMCP-38) is controlled by the AGENT_REGISTRY_DSN env
+# var (provisioned in the PM2 env from Vault), NOT this file. Unset ⇒ the feature
+# is off and the dispatcher behaves exactly as before. The optional per-agent
+# `scoped_mcp_url` below is a best-effort registry value (not on the resume hot
+# path); omit it if you don't publish it.
+
 agents:
   research:
     room_id: "!roomid:your.homeserver"
     project_dir: "/home/user/.claude/projects/research"
     subprocess_timeout_seconds: 1800  # optional, default 300
+    scoped_mcp_url: "http://127.0.0.1:PORT"  # optional, recorded in sessions registry
   dev:
     room_id: "!roomid:your.homeserver"
     project_dir: "/home/user/.claude/projects/dev"

@@ -2,3 +2,7 @@ venv/
 __pycache__/
 *.pyc
 config.yml
+.env
+*.env
+core.*
+*.core

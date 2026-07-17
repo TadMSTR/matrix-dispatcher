@@ -8,9 +8,10 @@ A PM2 daemon that watches each agent's Matrix room for messages from a trusted s
 @you sends message to #research
         ↓
 matrix-dispatcher (PM2, polls every 5s)
-        ↓  room-root message  → spawn new session
-        ↓  thread reply       → resume prior session via --resume <session_id>
-        ↓  !<command>         → intercepted (no spawn)
+        ↓  room-root message         → spawn new session
+        ↓  thread reply (tracked)    → resume prior session via --resume <session_id>
+        ↓  thread reply (orphaned)   → no spawn (see below)
+        ↓  !<command>                → intercepted (no spawn)
 asyncio.create_subprocess_exec("claude", "-p", "--session-id", uuid, prompt, ...)
   cwd: <project_dir>
         ↓  stdout
@@ -19,6 +20,18 @@ Dispatcher posts response back to the Matrix room
 ```
 
 **Routing discriminator:** Matrix thread structure only — room-root spawns, thread reply resumes. No timers, no AI judgment about intent.
+
+**Orphaned replies never spawn (MDISP-6, v0.4.1).** A thread reply whose thread root has no
+dispatcher-tracked session is *not* treated as a room-root message. Two cases:
+- **Reply to a foreign bot's post** — agent rooms are shared with other bots that post in
+  threads (scoped-mcp HITL prompts, `matrix-hitl-bot`, etc.). A reply to one of those is
+  ignored silently; the dispatcher never spawns off a thread it didn't create.
+- **Reply to our own expired thread** — the session behind that thread has aged out of
+  tracking. The dispatcher posts a hint pointing at a fresh (non-threaded) message or
+  `!sessions`, rather than silently doing nothing or spawning a disconnected session.
+
+This is fail-closed: any error fetching the parent event is treated as foreign (no spawn).
+`!mirror` is the supported way to adopt an untracked session into the routing table.
 
 **Element reply quirk:** Element sometimes uses `m.in_reply_to` instead of the spec-correct `rel_type=m.thread`. The `event_aliases` table maps acknowledgment and response chunk event IDs back to their parent session, so a reply to any of those events still resolves to the right session.
 

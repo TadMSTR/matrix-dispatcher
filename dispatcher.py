@@ -269,6 +269,28 @@ async def post_message(
     return getattr(resp, "event_id", "")
 
 
+async def _get_event_sender(
+    client: AsyncClient, room_id: str, event_id: str
+) -> str | None:
+    """Return the sender of an event, or None if it can't be fetched.
+
+    Used only on the orphaned-reply path to distinguish our own expired
+    threads from foreign-bot messages. Fail-closed: any error -> None ->
+    treated as foreign (silent ignore), never a spawn.
+
+    Note: nio's RoomGetEventResponse has a .event attribute; RoomGetEventError
+    does not -- the getattr guard handles the error-response case without an
+    isinstance import.
+    """
+    try:
+        resp = await client.room_get_event(room_id, event_id)
+    except Exception:
+        log.exception("action=get_event_error room=%s event_id=%s", room_id, event_id)
+        return None
+    fetched = getattr(resp, "event", None)
+    return getattr(fetched, "sender", None)
+
+
 def split_on_paragraphs(text: str, max_len: int) -> list[str]:
     if len(text) <= max_len:
         return [text]
@@ -757,6 +779,7 @@ async def handle_event(
     agent_name: str,
     project_dir: str,
     db: sqlite3.Connection,
+    bot_user_id: str = "",
     subprocess_timeout_seconds: int = SUBPROCESS_TIMEOUT_SECONDS,
 ) -> None:
     # Security flag B: sender gate — first check, silently discard non-trusted
@@ -848,13 +871,37 @@ async def handle_event(
                     thread_root_id=thread_root_id,
                 )
             return
-        # Orphaned reply (session unknown — maybe started before dispatcher)
-        log.info(
-            "action=orphaned_reply room=%s event_id=%s thread_root=%s — spawning new",
-            room_id, event.event_id, thread_root,
-        )
+        # Orphaned reply: thread root has no tracked session. Never spawn a new
+        # session from a reply — that only ever produces a context-free duplicate
+        # (the supported way to adopt an untracked session is !mirror). Determine
+        # whether the replied-to event is one of our own posts vs. a foreign
+        # message, to pick hint vs. silence. Fail-closed: unknown -> foreign.
+        parent_sender = await _get_event_sender(client, room_id, thread_root)
+        if bot_user_id and parent_sender == bot_user_id:
+            # Our own thread whose session was cleaned up (retention) — give Ted
+            # a usable next step instead of silent nothing.
+            log.info(
+                "action=expired_thread_reply room=%s event_id=%s thread_root=%s",
+                room_id, event.event_id, thread_root,
+            )
+            await post_message(
+                client, room_id,
+                f"{mention_user} No active session for that thread (it may have "
+                f"expired). Send a new message (not a reply) to start one, or "
+                f"`!sessions` to list recent ones.",
+                reply_to=event.event_id,
+            )
+        else:
+            # Foreign-bot / third-party message (scoped-mcp HITL, matrix-hitl-bot,
+            # matrix-admin-bot, matrix-task-queue-bot, etc.) — the reply was meant
+            # for that bot, not the dispatcher. Ignore silently; no room noise.
+            log.info(
+                "action=foreign_reply_ignored room=%s event_id=%s thread_root=%s sender=%s",
+                room_id, event.event_id, thread_root, parent_sender or "unknown",
+            )
+        return
 
-    # Room-root (or orphaned reply) → spawn new session.
+    # Room-root (thread_root is None) → spawn new session.
     # Acquire lock first so rate-limit + spawn are atomic per room — with
     # concurrent handlers, two messages racing the rate-limit check would
     # otherwise both pass.
@@ -932,6 +979,7 @@ async def handle_event(
 async def poll_loop(client: AsyncClient, config: dict, db: sqlite3.Connection) -> None:
     trusted_sender: str = config.get("trusted_sender", "")
     mention_user: str = config.get("mention_user", "")
+    bot_user_id: str = config.get("bot_user_id", "")
     poll_interval: int = config.get("poll_interval_seconds", 5)
     max_message_length: int = config.get("max_message_length", 4000)
 
@@ -994,6 +1042,7 @@ async def poll_loop(client: AsyncClient, config: dict, db: sqlite3.Connection) -
                         agent_name=agent_name,
                         project_dir=project_dir,
                         db=db,
+                        bot_user_id=bot_user_id,
                         subprocess_timeout_seconds=agent_cfg.get(
                             "subprocess_timeout_seconds", SUBPROCESS_TIMEOUT_SECONDS
                         ),

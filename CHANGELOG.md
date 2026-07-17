@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+### Fixed
+- Orphaned / foreign-bot replies no longer spawn a new session (MDISP-6). A reply
+  whose thread root has no tracked session is never treated as a spawn trigger:
+  replies to our own expired threads get an actionable hint, replies to foreign-bot
+  posts (scoped-mcp HITL, matrix-hitl-bot, etc.) are ignored silently. Fail-closed —
+  any error fetching the parent event is treated as foreign (no spawn).
+
+### Added
+- First automated test suite (`tests/test_handle_event.py`, `pytest` + `pytest-asyncio`)
+  covering the `handle_event` dispatch outcomes; `requirements-dev.txt` for dev deps.
+
 ## [0.4.0] - 2026-04-25
 
 ### Added

@@ -22,10 +22,11 @@ Include as much detail as possible: the affected component, steps to reproduce, 
 
 **Out of scope:**
 
-- Vulnerabilities in the host system, underlying services, or MCP transport layer
-- Issues that require attacker control of configuration environment variables
+- Vulnerabilities in the host system, the Matrix homeserver, or the `claude` CLI itself
+- Issues that require attacker control of configuration or environment variables
   (operator-controlled trust boundaries, not input attack surfaces)
-- Theoretical weaknesses without a realistic attack path against the MCP tool surface
+- Theoretical weaknesses without a realistic attack path against the dispatcher's
+  message-handling or subprocess-spawning surface
 
 ## Response Expectations
 

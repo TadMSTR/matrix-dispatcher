@@ -17,7 +17,6 @@ import pytest
 
 import dispatcher
 
-
 TRUSTED = "@admin:example.org"
 BOT_USER_ID = "@dispatcher-bot:example.org"
 FOREIGN = "@other-bot:example.org"
@@ -28,6 +27,7 @@ ROOM = "!room:example.org"
 # --------------------------------------------------------------------------- #
 # Fakes
 # --------------------------------------------------------------------------- #
+
 
 class _SendResponse:
     def __init__(self, event_id: str) -> None:
@@ -63,9 +63,7 @@ class FakeClient:
         self._counter += 1
         relates = content.get("m.relates_to", {})
         reply_to = relates.get("m.in_reply_to", {}).get("event_id")
-        self.sent.append(
-            {"room_id": room_id, "body": content.get("body"), "reply_to": reply_to}
-        )
+        self.sent.append({"room_id": room_id, "body": content.get("body"), "reply_to": reply_to})
         return _SendResponse(f"$sent{self._counter}")
 
     async def room_get_event(self, room_id, event_id):
@@ -99,14 +97,13 @@ def make_event(sender: str, body: str, event_id: str, reply_to: str | None = Non
     content: dict = {"body": body}
     if reply_to is not None:
         content["m.relates_to"] = {"m.in_reply_to": {"event_id": reply_to}}
-    return SimpleNamespace(
-        sender=sender, body=body, event_id=event_id, source={"content": content}
-    )
+    return SimpleNamespace(sender=sender, body=body, event_id=event_id, source={"content": content})
 
 
 # --------------------------------------------------------------------------- #
 # Fixtures
 # --------------------------------------------------------------------------- #
+
 
 @pytest.fixture
 def db():
@@ -146,6 +143,7 @@ async def _dispatch(client, event, db, bot_user_id=BOT_USER_ID):
 # --------------------------------------------------------------------------- #
 # Tests
 # --------------------------------------------------------------------------- #
+
 
 async def test_foreign_bot_reply_never_spawns(db, spies, caplog):
     """The reported bug: replying to a foreign-bot post must not spawn."""

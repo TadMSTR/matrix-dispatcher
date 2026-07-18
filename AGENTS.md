@@ -11,11 +11,19 @@ Listens to Matrix rooms via matrix-nio, spawns a `claude -p` subprocess per room
 ```
 dispatcher.py                  Main bot — matrix-nio client, per-room concurrency lock,
                                rate limiter, SQLite session tracking, subprocess management
+agent_registry.py              Fail-open agent-postgres client (HITL resume-on-approval)
 config.yml                     Active config (gitignored — see config.example.yml)
 config.example.yml             Reference configuration
-ecosystem.forge.config.js      PM2 config for forge deployment
-requirements.txt               Pinned exact versions
+ecosystem.config.js            PM2 config (portable — no hardcoded paths)
+start.sh                       PM2 launch wrapper (sources credentials env, execs venv python)
+pyproject.toml                 Build + pinned deps + ruff/mypy/pytest/coverage config
+.github/workflows/             CI (ruff, mypy, pytest --cov, pip-audit) + source release
+tests/                         pytest suite (see Testing)
 ```
+
+Forge-specific deployment files (`config.forge.yml`, `start-forge.sh`,
+`ecosystem.forge.config.js`) are **not** in this public repo — they live in a private
+deploy repo and are gitignored here (`*.forge.*`, `*-forge.*`).
 
 ## Architecture decisions
 
@@ -24,7 +32,7 @@ requirements.txt               Pinned exact versions
 - **Minimal subprocess env** — subprocesses receive only a curated allowlist of env vars, not the full `os.environ`. This prevents credential leakage into Claude sessions.
 - **No message body in logs** — only event IDs, room IDs, session IDs, and exit codes are written to the log. Message content is never persisted by the dispatcher.
 - **SQLite session tracking** — `DB_PATH = ~/.claude/data/matrix-dispatcher/sessions.db`. Enables `!sessions` and `!recap` commands. Orphaned processes run to completion after a restart; the dispatcher does not SIGKILL them.
-- **`/cancel`** — sends SIGTERM to the active subprocess for the room and waits up to `CANCEL_REGISTRATION_WAIT_SECONDS` for a registration acknowledgement before giving up.
+- **`!cancel`** — sends SIGTERM to the active subprocess for the room and waits up to `CANCEL_REGISTRATION_WAIT_SECONDS` for a registration acknowledgement before giving up. (All dispatcher commands use the `!` prefix — Element intercepts `/`-prefixed messages client-side.)
 - **HITL resume-on-approval reconcile loop** (SMCP-38, v0.5.0) — a background task
   (`RECONCILE_INTERVAL_SECONDS = 10`) polls the local `pending_approvals` SQLite table
   (rows written when a turn ends with an approval still pending) and cross-checks each
@@ -60,7 +68,22 @@ off and the dispatcher behaves exactly as before this feature (fail-open by desi
 
 ## Testing
 
-No automated tests. Manual testing requires a Matrix homeserver and a bot account. Use a test room to validate spawn/cancel/session tracking before deploying changes.
+`pytest` suite under `tests/` (async via `pytest-asyncio`), run in CI on Python
+3.11/3.12/3.13 with coverage gated at 80% (currently ~98%). Tests use a fake Matrix
+client, an in-memory SQLite DB, and monkeypatched spawn/resume — no real homeserver,
+network, or `claude` binary is required. `_run_claude` is exercised against short-lived
+real processes (`/bin/echo`, `/bin/sh`) so the subprocess/env-allowlist path runs
+end-to-end.
+
+```bash
+pip install -e '.[dev]'
+ruff check . && ruff format --check .
+mypy dispatcher.py agent_registry.py
+pytest --cov --cov-report=term-missing
+```
+
+Manual smoke testing (spawn/resume/`!cancel`) still needs a Matrix homeserver and a bot
+account in a throwaway room.
 
 ## Git workflow
 

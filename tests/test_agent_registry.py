@@ -41,7 +41,9 @@ async def test_get_registry_uses_vault_when_configured(monkeypatch):
     monkeypatch.setenv("AGENT_REGISTRY_DSN", "postgresql://env-fallback/should-not-be-used")
 
     monkeypatch.setattr(
-        agent_registry, "_read_dsn_from_vault_sync", lambda: "postgresql://from-vault/agent_platform"
+        agent_registry,
+        "_read_dsn_from_vault_sync",
+        lambda: "postgresql://from-vault/agent_platform",
     )
 
     seen = {}
@@ -147,9 +149,9 @@ def _fake_hvac_client(*, dsn_value=None, login_error=None, revoke_error=None, re
 
     class FakeAuth:
         approle = types.SimpleNamespace(
-            login=lambda role_id, secret_id: (_ for _ in ()).throw(login_error)
-            if login_error
-            else None
+            login=lambda role_id, secret_id: (
+                (_ for _ in ()).throw(login_error) if login_error else None
+            )
         )
         token = types.SimpleNamespace(revoke_self=_revoke_self)
 

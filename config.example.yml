@@ -1,8 +1,15 @@
 trusted_sender: "@your-user:your.homeserver"
 mention_user: "@your-user:your.homeserver"
+# The dispatcher bot's own Matrix user ID. Used to tell "reply to our own expired
+# thread" (post a hint) from "reply to a foreign bot" (ignore silently). Omit and
+# every orphaned reply is treated as foreign.
+bot_user_id: "@dispatcher-bot:your.homeserver"
 poll_interval_seconds: 5
 max_message_length: 4000
 session_retention_days: 30
+# Agent room to post a one-line "started" notice to on launch (must be a key in
+# `agents` below). Omit to skip the startup notification.
+startup_notification_agent: research
 
 # HITL resume-on-approval (SMCP-38) is controlled by the AGENT_REGISTRY_DSN env
 # var (provisioned in the PM2 env from Vault), NOT this file. Unset ⇒ the feature

@@ -1,0 +1,77 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "matrix-dispatcher"
+version = "0.6.0"
+description = "Spawn or resume `claude -p` agent sessions from Matrix room messages."
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.11"
+authors = [{ name = "TadMSTR" }]
+keywords = ["matrix", "claude", "agents", "dispatcher", "nio"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "License :: OSI Approved :: MIT License",
+]
+dependencies = [
+  "matrix-nio==0.25.2",
+  "pyyaml==6.0.2",
+  "asyncpg==0.31.0",
+  "hvac==2.4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest==9.1.1",
+  "pytest-asyncio==1.4.0",
+  "pytest-cov==7.1.0",
+  "ruff==0.15.22",
+  "mypy==2.3.0",
+  "pip-audit==2.10.1",
+]
+
+# Flat-module service (monolith split is a deferred follow-up). Ship the two
+# top-level modules explicitly so `pip install -e '.[dev]'` works in CI.
+[tool.hatch.build.targets.wheel]
+include = ["dispatcher.py", "agent_registry.py"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["dispatcher", "agent_registry"]
+omit = ["tests/*"]
+
+[tool.coverage.report]
+fail_under = 80
+show_missing = true
+exclude_lines = [
+  "pragma: no cover",
+  "if __name__ == .__main__.:",
+  "raise NotImplementedError",
+]
+
+[tool.mypy]
+python_version = "3.11"
+warn_redundant_casts = true
+warn_unused_ignores = true
+no_implicit_optional = true
+check_untyped_defs = true
+
+[[tool.mypy.overrides]]
+module = ["nio", "nio.*", "asyncpg", "asyncpg.*", "hvac", "hvac.*", "yaml"]
+ignore_missing_imports = true

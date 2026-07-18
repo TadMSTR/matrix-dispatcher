@@ -284,7 +284,8 @@ async def get_registry() -> RegistryClient:
             return _registry
         dsn = ""
         if _vault_configured():
-            dsn = await asyncio.to_thread(_read_dsn_from_vault_sync) or ""
+            vault_dsn = await asyncio.to_thread(_read_dsn_from_vault_sync)
+            dsn = vault_dsn or ""
             if dsn:
                 log.info("action=registry_dsn_source_vault")
         if not dsn:

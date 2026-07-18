@@ -1,22 +1,44 @@
 # matrix-dispatcher
 
+[![Built with Claude Code](https://img.shields.io/badge/Built_with-Claude_Code-6B57FF?logo=claude&logoColor=white)](https://claude.ai/code)
+[![CI](https://github.com/TadMSTR/matrix-dispatcher/actions/workflows/ci.yml/badge.svg)](https://github.com/TadMSTR/matrix-dispatcher/actions/workflows/ci.yml)
+[![Python versions](https://img.shields.io/badge/python-3.11_|_3.12_|_3.13-blue.svg)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 A PM2 daemon that watches each agent's Matrix room for messages from a trusted sender, spawns or resumes `claude -p` sessions, and posts the response back. Send a message to the room → the agent replies. Reply inside a thread → the same session resumes. Bang-prefix commands provide session management without spawning anything.
 
 ## How it works
 
+### Data flow
+
+```mermaid
+flowchart TD
+    A["@you posts to an agent room"] --> B["matrix-dispatcher<br/>polls /sync every 5s"]
+    B --> C{"Matrix thread structure?"}
+    C -->|room-root message| D["spawn<br/>claude -p --session-id UUID"]
+    C -->|thread reply, tracked| E["resume<br/>claude -p --resume session_id"]
+    C -->|thread reply, orphaned| F["no spawn:<br/>hint or silent-ignore"]
+    C -->|! command| G["handle in-process<br/>(no spawn)"]
+    D --> H["subprocess stdout"]
+    E --> H
+    H --> I["post response to room<br/>(@you mention → push notification)"]
 ```
-@you sends message to #research
-        ↓
-matrix-dispatcher (PM2, polls every 5s)
-        ↓  room-root message         → spawn new session
-        ↓  thread reply (tracked)    → resume prior session via --resume <session_id>
-        ↓  thread reply (orphaned)   → no spawn (see below)
-        ↓  !<command>                → intercepted (no spawn)
-asyncio.create_subprocess_exec("claude", "-p", "--session-id", uuid, prompt, ...)
-  cwd: <project_dir>
-        ↓  stdout
-Dispatcher posts response back to the Matrix room
-  (with @you mention so Element fires a push notification)
+
+### Components
+
+```mermaid
+flowchart LR
+    RM["Agent Matrix rooms"]
+    subgraph proc["matrix-dispatcher process"]
+      PL["poll_loop"] --> HE["handle_event"]
+      HE --> SP["_run_claude<br/>minimal-env subprocess"]
+      HE --> DB[("SQLite:<br/>sessions · event_aliases ·<br/>poll_state · pending_approvals")]
+      RL["reconcile_loop<br/>(HITL resume-on-approval)"] --> DB
+      CL["cleanup_loop<br/>(retention)"] --> DB
+    end
+    RM <-->|"nio /sync + room_send"| PL
+    SP -->|"claude -p"| CLI["claude CLI"]
+    RL <-->|"fail-open"| PG[("agent-postgres<br/>hitl_approvals")]
 ```
 
 **Routing discriminator:** Matrix thread structure only — room-root spawns, thread reply resumes. No timers, no AI judgment about intent.
@@ -60,7 +82,9 @@ Commands use the `!` prefix because Element intercepts `/`-prefixed messages cli
 
 ```bash
 python3 -m venv venv
-venv/bin/pip install -r requirements.txt
+venv/bin/pip install .          # runtime only
+# or, for development (linters, mypy, pytest):
+venv/bin/pip install -e '.[dev]'
 ```
 
 ### 2. Write credentials file
@@ -127,7 +151,7 @@ Sessions older than `session_retention_days` (default 30) and orphaned `event_al
 - All SQLite queries are parameterized — no f-string SQL construction anywhere in the dispatcher.
 - `sessions.db` is created with mode 600.
 - JSONL stems are validated with `uuid.UUID()` before being passed to `--resume` argv.
-- `requirements.txt` pins exact versions.
+- `pyproject.toml` pins exact runtime dependency versions; CI runs `pip-audit --strict`.
 
 ## Phases
 
@@ -137,19 +161,24 @@ Sessions older than `session_retention_days` (default 30) and orphaned `event_al
 | v0.2 | shipped | SQLite session store, thread-based resume, `event_aliases` for Element reply quirk |
 | v0.3 | shipped | `!sessions`, `!recap`, `!mirror`, `!help`; 30-day retention cleanup |
 | v0.4 | shipped | Async subprocess, per-room concurrency lock, per-room rate limit, `!cancel`, startup notification |
+| v0.5 | shipped | HITL resume-on-approval (SMCP-38): reconcile loop resumes a gated session once its approval lands; Vault-backed registry DSN (SMCP-42) |
 
-See [CHANGELOG.md](CHANGELOG.md) for per-phase detail.
+See [CHANGELOG.md](CHANGELOG.md) for per-phase detail, and [ARCHITECTURE.md](ARCHITECTURE.md)
+for the DB schema, dispatch flow, and subprocess/env model.
 
 ## Files
 
 ```
 matrix-dispatcher/
 ├── dispatcher.py       # main daemon
+├── agent_registry.py   # fail-open agent-postgres client (HITL resume-on-approval)
 ├── config.yml          # live config (not committed — contains room IDs)
 ├── config.example.yml  # committed template
-├── requirements.txt    # pinned deps
+├── pyproject.toml      # build + pinned deps + ruff/mypy/pytest/coverage config
 ├── ecosystem.config.js # PM2 definition (uses start.sh)
 ├── start.sh            # sources credentials env file, execs dispatcher
+├── tests/              # pytest suite (async, ~98% coverage)
+├── .github/workflows/  # CI + source-only release
 └── venv/               # local venv
 ~/.claude/data/matrix-dispatcher/
 └── sessions.db         # SQLite (sessions, event_aliases, poll_state)

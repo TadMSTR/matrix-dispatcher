@@ -2,6 +2,44 @@
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-07-18
+
+Showcase-tier promotion + public-history security remediation.
+
+### Added
+- Showcase tooling: `pyproject.toml` (hatchling) consolidating pinned runtime + dev
+  deps and ruff / mypy / pytest / coverage config; GitHub Actions CI (ruff, mypy,
+  `pytest --cov` ≥ 80% on Python 3.11 / 3.12 / 3.13, `pip-audit --strict`); a
+  source-only release workflow; `.pre-commit-config.yaml`.
+- Test suite lifted from ~43% to ~98% coverage (new unit / command / loop / registry
+  suites). The subprocess + env-allowlist + UUID-argv security path is covered
+  end-to-end against real short-lived processes.
+- Docs: `ARCHITECTURE.md`, `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md`, PR + issue
+  templates; README badges and Mermaid data-flow / component diagrams;
+  `config.example.yml` now documents `bot_user_id` and `startup_notification_agent`.
+
+### Changed
+- Deploy templates (`start.sh`, `ecosystem.config.js`) are now portable — no hardcoded
+  home paths (resolve via `$SCRIPT_DIR` / `__dirname` / `$HOME`). Install is now
+  `pip install .` / `pip install -e '.[dev]'`; `requirements*.txt` removed (deps live
+  in `pyproject.toml`).
+
+### Fixed
+- Genericized a test fixture that embedded a real host path
+  (`/home/ted/.claude/projects/sysadmin`) introduced during the coverage lift — resolves
+  the Showcase-audit LOW finding.
+
+### Security
+- **Purged leaked forge topology from all public git history** (`git filter-repo` +
+  force-push, rewritten tags, stale merged-PR branches deleted). The Matrix homeserver,
+  bot/admin user IDs, five real room IDs, and host paths had been committed via
+  `config.forge.yml` / `start-forge.sh` / `ecosystem.forge.config.js` and test
+  fixtures; all are removed from every clone-reachable commit and the deployment files
+  now live only in a private repo (gitignored here via `*.forge.*` / `*-forge.*` /
+  `config.*.yml`). No credentials were ever committed (env-var names only), so no
+  secret rotation was required. Note: GitHub `refs/pull/*` still pin the old commits by
+  SHA until GitHub Support expunges them.
+
 ## [0.5.1] - 2026-07-18
 
 ### Added

@@ -18,7 +18,6 @@ import pytest
 
 import dispatcher
 
-
 TRUSTED = "@admin:example.org"
 MENTION = "@ted"
 ROOM = "!room:example.org"
@@ -35,6 +34,7 @@ CONFIG = {
 # Fakes
 # --------------------------------------------------------------------------- #
 
+
 class _SendResponse:
     def __init__(self, event_id: str) -> None:
         self.event_id = event_id
@@ -49,9 +49,7 @@ class FakeClient:
         self._counter += 1
         relates = content.get("m.relates_to", {})
         reply_to = relates.get("m.in_reply_to", {}).get("event_id")
-        self.sent.append(
-            {"room_id": room_id, "body": content.get("body"), "reply_to": reply_to}
-        )
+        self.sent.append({"room_id": room_id, "body": content.get("body"), "reply_to": reply_to})
         return _SendResponse(f"$sent{self._counter}")
 
 
@@ -100,14 +98,13 @@ def make_event(sender: str, body: str, event_id: str, reply_to: str | None = Non
     content: dict = {"body": body}
     if reply_to is not None:
         content["m.relates_to"] = {"m.in_reply_to": {"event_id": reply_to}}
-    return SimpleNamespace(
-        sender=sender, body=body, event_id=event_id, source={"content": content}
-    )
+    return SimpleNamespace(sender=sender, body=body, event_id=event_id, source={"content": content})
 
 
 # --------------------------------------------------------------------------- #
 # Fixtures
 # --------------------------------------------------------------------------- #
+
 
 @pytest.fixture
 def db():
@@ -148,11 +145,16 @@ async def _spawn_via_handle_event(client, event, db, registry):
 # Post-turn pending detection
 # --------------------------------------------------------------------------- #
 
+
 async def test_spawn_detects_pending_and_links(db, spies):
     """A gated call during a spawn turn is recorded locally and linked in PG."""
-    reg = FakeRegistry(pending={
-        "approval_id": f"{AGENT}.abc123", "tool_name": "gitea_pr_merge", "created_at": None,
-    })
+    reg = FakeRegistry(
+        pending={
+            "approval_id": f"{AGENT}.abc123",
+            "tool_name": "gitea_pr_merge",
+            "created_at": None,
+        }
+    )
     client = FakeClient()
     event = make_event(TRUSTED, "merge that PR", "$root", reply_to=None)
 
@@ -186,9 +188,14 @@ async def test_no_pending_records_nothing(db, spies):
 
 async def test_disabled_registry_no_detection(db, spies):
     """Fail-open: a disabled registry records nothing and still spawns."""
-    reg = FakeRegistry(enabled=False, pending={
-        "approval_id": f"{AGENT}.x", "tool_name": "t", "created_at": None,
-    })
+    reg = FakeRegistry(
+        enabled=False,
+        pending={
+            "approval_id": f"{AGENT}.x",
+            "tool_name": "t",
+            "created_at": None,
+        },
+    )
     client = FakeClient()
     event = make_event(TRUSTED, "hello", "$root3", reply_to=None)
 
@@ -203,6 +210,7 @@ async def test_disabled_registry_no_detection(db, spies):
 # --------------------------------------------------------------------------- #
 # Reconcile loop
 # --------------------------------------------------------------------------- #
+
 
 def _seed_pending(db, approval_id, session_id="sess-1", tool="gitea_pr_merge"):
     dispatcher.insert_session(db, "$root", ROOM, AGENT, session_id)
@@ -318,6 +326,4 @@ async def test_reconcile_resume_failure_notifies(db, spies, monkeypatch):
 
     # Row was claimed (deleted) AND an operator notice was posted — not silent.
     assert dispatcher.get_pending_approvals(db) == []
-    assert any(
-        "retry the request manually" in s["body"].lower() for s in client.sent
-    )
+    assert any("retry the request manually" in s["body"].lower() for s in client.sent)

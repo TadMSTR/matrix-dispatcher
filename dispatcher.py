@@ -19,6 +19,7 @@ Security flags addressed:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -27,7 +28,7 @@ import sqlite3
 import sys
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import yaml
@@ -58,7 +59,7 @@ CANCEL_POLL_INTERVAL_SECONDS = 0.05
 # approval-state transitions on locally-tracked pending approvals and resumes the
 # originating session once an operator approval lands. Interval must be « the
 # scoped-mcp pre-approval token TTL (300s) so the resumed retry lands well inside
-# the token's life. Local pending rows are expired after 2× the HITL timeout
+# the token's life. Local pending rows are expired after 2x the HITL timeout
 # default (300s) so an approval that is never actioned can't accumulate.
 RECONCILE_INTERVAL_SECONDS = 10
 PENDING_APPROVAL_EXPIRY_SECONDS = 600
@@ -68,6 +69,7 @@ def _room_lock(room_id: str) -> asyncio.Lock:
     if room_id not in _room_locks:
         _room_locks[room_id] = asyncio.Lock()
     return _room_locks[room_id]
+
 
 # ---------------------------------------------------------------------------
 # Logging — structured, no message body content
@@ -98,6 +100,7 @@ def load_config() -> dict:
 # ---------------------------------------------------------------------------
 # SQLite DB layer — security flag D: parameterized queries throughout
 # ---------------------------------------------------------------------------
+
 
 def open_db() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -179,9 +182,7 @@ def migrate_v1_tokens(db: sqlite3.Connection) -> None:
 
 
 def get_since(db: sqlite3.Connection) -> str | None:
-    row = db.execute(
-        "SELECT since FROM poll_state WHERE room_id = ?", ("global",)
-    ).fetchone()
+    row = db.execute("SELECT since FROM poll_state WHERE room_id = ?", ("global",)).fetchone()
     return row["since"] if row else None
 
 
@@ -201,9 +202,7 @@ def get_session(db: sqlite3.Connection, thread_root_id: str) -> sqlite3.Row | No
 
 def get_session_by_event(db: sqlite3.Connection, event_id: str) -> sqlite3.Row | None:
     """Look up a session by any related event ID (thread root, ack, or response chunk)."""
-    row = db.execute(
-        "SELECT * FROM sessions WHERE thread_root_id = ?", (event_id,)
-    ).fetchone()
+    row = db.execute("SELECT * FROM sessions WHERE thread_root_id = ?", (event_id,)).fetchone()
     if row:
         return row
     alias = db.execute(
@@ -256,6 +255,7 @@ def touch_session(db: sqlite3.Connection, thread_root_id: str) -> None:
 # HITL pending-approval store (SMCP-38) — local mapping approval → session.
 # ---------------------------------------------------------------------------
 
+
 def insert_pending_approval(
     db: sqlite3.Connection,
     approval_id: str,
@@ -287,16 +287,21 @@ def delete_pending_approval(db: sqlite3.Connection, approval_id: str) -> None:
 # Dispatcher credentials — security flag B: assert non-empty at startup
 # ---------------------------------------------------------------------------
 
+
 def get_dispatcher_credentials() -> tuple[str, str, str]:
     homeserver = os.environ.get("DISPATCHER_HOMESERVER", "").strip()
     user_id = os.environ.get("DISPATCHER_USER_ID", "").strip()
     token = os.environ.get("DISPATCHER_ACCESS_TOKEN", "").strip()
 
-    missing = [k for k, v in [
-        ("DISPATCHER_HOMESERVER", homeserver),
-        ("DISPATCHER_USER_ID", user_id),
-        ("DISPATCHER_ACCESS_TOKEN", token),
-    ] if not v]
+    missing = [
+        k
+        for k, v in [
+            ("DISPATCHER_HOMESERVER", homeserver),
+            ("DISPATCHER_USER_ID", user_id),
+            ("DISPATCHER_ACCESS_TOKEN", token),
+        ]
+        if not v
+    ]
 
     if missing:
         log.error("Missing required env vars at startup: %s", ", ".join(missing))
@@ -308,6 +313,7 @@ def get_dispatcher_credentials() -> tuple[str, str, str]:
 # ---------------------------------------------------------------------------
 # Matrix helpers
 # ---------------------------------------------------------------------------
+
 
 async def post_message(
     client: AsyncClient,
@@ -327,9 +333,7 @@ async def post_message(
     return getattr(resp, "event_id", "")
 
 
-async def _get_event_sender(
-    client: AsyncClient, room_id: str, event_id: str
-) -> str | None:
+async def _get_event_sender(client: AsyncClient, room_id: str, event_id: str) -> str | None:
     """Return the sender of an event, or None if it can't be fetched.
 
     Used only on the orphaned-reply path to distinguish our own expired
@@ -366,7 +370,7 @@ def split_on_paragraphs(text: str, max_len: int) -> list[str]:
                 chunks.append(current)
             if len(para) > max_len:
                 for i in range(0, len(para), max_len):
-                    chunks.append(para[i:i + max_len])
+                    chunks.append(para[i : i + max_len])
                 current = ""
             else:
                 current = para
@@ -380,6 +384,7 @@ def split_on_paragraphs(text: str, max_len: int) -> list[str]:
 # ---------------------------------------------------------------------------
 # Spawn / Resume — security flag C: minimal env allowlist
 # ---------------------------------------------------------------------------
+
 
 def _minimal_env(agent_name: str) -> dict[str, str]:
     env = {
@@ -420,18 +425,17 @@ async def _run_claude(
     _active_processes[room_id] = proc
     try:
         stdout_b, stderr_b = await asyncio.wait_for(
-            proc.communicate(), timeout=timeout,
+            proc.communicate(),
+            timeout=timeout,
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         proc.kill()
         await proc.wait()
         # Drain pipe transports — wait_for cancelled communicate() mid-read,
         # leaving stdout/stderr file descriptors open. communicate() is
         # idempotent post-exit and closes the transports.
-        try:
+        with contextlib.suppress(Exception):
             await proc.communicate()
-        except Exception:
-            pass
         raise
     finally:
         _active_processes.pop(room_id, None)
@@ -439,6 +443,11 @@ async def _run_claude(
     rc = proc.returncode if proc.returncode is not None else -1
     stdout = stdout_b.decode(errors="replace").strip()
     stderr = stderr_b.decode(errors="replace").strip()
+    # SECURITY[accepted]: on nonzero exit the (bounded, 500-char) stderr is surfaced to
+    # the room. The destination room is trusted-sender-gated (dispatcher.py:1203) and
+    # operator-owned, so the operator only ever sees their own agent's stderr — no
+    # cross-trust-boundary disclosure. Accepted in the 2026-07-18 Showcase audit (Info
+    # finding); see host-forge/build-reports accepted-risks.md.
     output = stdout if rc == 0 else stderr[:500]
     return rc, output
 
@@ -453,7 +462,10 @@ async def spawn_claude(
 ) -> tuple[int, str]:
     return await _run_claude(
         ["claude", "-p", "--session-id", session_id, prompt],
-        project_dir, agent_name, room_id, timeout=timeout,
+        project_dir,
+        agent_name,
+        room_id,
+        timeout=timeout,
     )
 
 
@@ -467,7 +479,10 @@ async def resume_claude(
 ) -> tuple[int, str]:
     return await _run_claude(
         ["claude", "-p", "--resume", session_id, message],
-        project_dir, agent_name, room_id, timeout=timeout,
+        project_dir,
+        agent_name,
+        room_id,
+        timeout=timeout,
     )
 
 
@@ -476,6 +491,7 @@ async def resume_claude(
 # Both helpers are no-ops when the registry is disabled/absent (fail-open): a
 # down agent-postgres must never affect the spawn/resume path.
 # ---------------------------------------------------------------------------
+
 
 async def _register_session(
     registry: RegistryClient | None,
@@ -531,13 +547,17 @@ async def _record_pending_if_gated(
     await registry.link_session(approval_id, session_id)
     log.info(
         "action=hitl_pending_detected room=%s session=%s approval=%s tool=%s",
-        room_id, session_id, approval_id, tool_name,
+        room_id,
+        session_id,
+        approval_id,
+        tool_name,
     )
 
 
 # ---------------------------------------------------------------------------
 # Message processing
 # ---------------------------------------------------------------------------
+
 
 def extract_thread_root(event: RoomMessageText) -> str | None:
     """Return the thread-root event ID for a reply, or None for a room-root message.
@@ -564,7 +584,8 @@ def extract_thread_root(event: RoomMessageText) -> str | None:
     if not isinstance(candidate, str):
         log.warning(
             "action=malformed_relates_to event_id=%s type=%s",
-            getattr(event, "event_id", "?"), type(candidate).__name__,
+            getattr(event, "event_id", "?"),
+            type(candidate).__name__,
         )
         return None
     return candidate
@@ -574,6 +595,7 @@ def extract_thread_root(event: RoomMessageText) -> str | None:
 # JSONL transcript helpers — read claude -p session transcripts for
 # /sessions, /recap, /mirror commands.
 # ---------------------------------------------------------------------------
+
 
 def project_jsonl_dir(project_dir: str) -> Path:
     """Convert a project directory path to its claude-code JSONL transcript dir."""
@@ -651,11 +673,13 @@ def read_last_n_turns(session_id: str, project_dir: str, n: int) -> str:
     except OSError as e:
         log.warning("action=transcript_read_error session=%s err=%s", session_id, e)
         return ""
-    pairs = turns[-(2 * n):]
+    pairs = turns[-(2 * n) :]
     return "\n\n".join(f"**{role}:**\n{text}" for role, text in pairs)
 
 
-def find_unmirrored_session_id(db: sqlite3.Connection, project_dir: str, room_id: str) -> str | None:
+def find_unmirrored_session_id(
+    db: sqlite3.Connection, project_dir: str, room_id: str
+) -> str | None:
     """Find the most recent JSONL session in project_dir not yet tracked for this room.
 
     Only files whose stem parses as a UUID are considered — the value flows into
@@ -665,9 +689,7 @@ def find_unmirrored_session_id(db: sqlite3.Connection, project_dir: str, room_id
     jsonl_dir = project_jsonl_dir(project_dir)
     if not jsonl_dir.exists():
         return None
-    rows = db.execute(
-        "SELECT session_id FROM sessions WHERE room_id = ?", (room_id,)
-    ).fetchall()
+    rows = db.execute("SELECT session_id FROM sessions WHERE room_id = ?", (room_id,)).fetchall()
     known = {r["session_id"] for r in rows}
     candidates: list[Path] = []
     for path in jsonl_dir.glob("*.jsonl"):
@@ -699,7 +721,8 @@ async def _post_response(
     short_id = session_id[:8]
     if exit_code != 0:
         event_id = await post_message(
-            client, room_id,
+            client,
+            room_id,
             f"{mention_user} Session {short_id} {action} error:\n\n{output}",
             reply_to=reply_target,
         )
@@ -725,7 +748,10 @@ HELP_TEXT = (
 
 
 async def handle_cancel_command(
-    client: AsyncClient, room_id: str, event: RoomMessageText, mention_user: str,
+    client: AsyncClient,
+    room_id: str,
+    event: RoomMessageText,
+    mention_user: str,
 ) -> None:
     proc = _active_processes.get(room_id)
     # If the room lock is held but no proc is registered yet, the spawn is
@@ -743,36 +769,47 @@ async def handle_cancel_command(
     if proc is None:
         log.info("action=cmd_cancel_noop room=%s event_id=%s", room_id, event.event_id)
         await post_message(
-            client, room_id,
+            client,
+            room_id,
             f"{mention_user} No active session in this room.",
             reply_to=event.event_id,
         )
         return
     pid = proc.pid
     log.info("action=cmd_cancel room=%s event_id=%s pid=%s", room_id, event.event_id, pid)
-    try:
+    with contextlib.suppress(ProcessLookupError):
         proc.send_signal(signal.SIGTERM)
-    except ProcessLookupError:
-        pass
     await post_message(
-        client, room_id,
+        client,
+        room_id,
         f"{mention_user} Sent SIGTERM to active session (pid {pid}).",
         reply_to=event.event_id,
     )
 
 
 async def handle_help_command(
-    client: AsyncClient, room_id: str, event: RoomMessageText, mention_user: str,
+    client: AsyncClient,
+    room_id: str,
+    event: RoomMessageText,
+    mention_user: str,
 ) -> None:
     log.info("action=cmd_help room=%s event_id=%s", room_id, event.event_id)
     await post_message(
-        client, room_id, f"{mention_user}\n\n{HELP_TEXT}", reply_to=event.event_id,
+        client,
+        room_id,
+        f"{mention_user}\n\n{HELP_TEXT}",
+        reply_to=event.event_id,
     )
 
 
 async def handle_sessions_command(
-    client: AsyncClient, room_id: str, event: RoomMessageText, mention_user: str,
-    agent_name: str, project_dir: str, db: sqlite3.Connection,
+    client: AsyncClient,
+    room_id: str,
+    event: RoomMessageText,
+    mention_user: str,
+    agent_name: str,
+    project_dir: str,
+    db: sqlite3.Connection,
 ) -> None:
     log.info("action=cmd_sessions room=%s event_id=%s", room_id, event.event_id)
     rows = db.execute(
@@ -781,12 +818,15 @@ async def handle_sessions_command(
     ).fetchall()
     if not rows:
         await post_message(
-            client, room_id, f"{mention_user} No sessions yet in this room.",
+            client,
+            room_id,
+            f"{mention_user} No sessions yet in this room.",
             reply_to=event.event_id,
         )
         return
     header_event_id = await post_message(
-        client, room_id,
+        client,
+        room_id,
         f"{mention_user} Recent sessions in #{agent_name} (reply to one to resume):",
         reply_to=event.event_id,
     )
@@ -794,7 +834,10 @@ async def handle_sessions_command(
         summary = read_first_user_message(row["session_id"], project_dir)
         text = f"{i}. ({row['session_id'][:8]}) {summary}"
         list_event_id = await post_message(
-            client, room_id, text, reply_to=header_event_id,
+            client,
+            room_id,
+            text,
+            reply_to=header_event_id,
         )
         # Reply to this list-item event resolves to the session via event_aliases
         register_alias(db, list_event_id, row["thread_root_id"])
@@ -809,8 +852,14 @@ def _parse_recap_n(arg: str, default: int = 5) -> int:
 
 
 async def handle_recap_command(
-    client: AsyncClient, room_id: str, event: RoomMessageText, mention_user: str,
-    project_dir: str, db: sqlite3.Connection, max_message_length: int, arg: str,
+    client: AsyncClient,
+    room_id: str,
+    event: RoomMessageText,
+    mention_user: str,
+    project_dir: str,
+    db: sqlite3.Connection,
+    max_message_length: int,
+    arg: str,
 ) -> None:
     n = _parse_recap_n(arg)
     log.info("action=cmd_recap room=%s event_id=%s n=%d", room_id, event.event_id, n)
@@ -820,14 +869,17 @@ async def handle_recap_command(
     ).fetchone()
     if row is None:
         await post_message(
-            client, room_id, f"{mention_user} No prior sessions to recap.",
+            client,
+            room_id,
+            f"{mention_user} No prior sessions to recap.",
             reply_to=event.event_id,
         )
         return
     body = read_last_n_turns(row["session_id"], project_dir, n)
     if not body:
         await post_message(
-            client, room_id,
+            client,
+            room_id,
             f"{mention_user} Session {row['session_id'][:8]} has no readable turns.",
             reply_to=event.event_id,
         )
@@ -839,27 +891,39 @@ async def handle_recap_command(
 
 
 async def handle_mirror_command(
-    client: AsyncClient, room_id: str, event: RoomMessageText, mention_user: str,
-    agent_name: str, project_dir: str, db: sqlite3.Connection,
-    registry: RegistryClient | None = None, scoped_mcp_url: str = "",
+    client: AsyncClient,
+    room_id: str,
+    event: RoomMessageText,
+    mention_user: str,
+    agent_name: str,
+    project_dir: str,
+    db: sqlite3.Connection,
+    registry: RegistryClient | None = None,
+    scoped_mcp_url: str = "",
 ) -> None:
     log.info("action=cmd_mirror room=%s event_id=%s", room_id, event.event_id)
     session_id = find_unmirrored_session_id(db, project_dir, room_id)
     if session_id is None:
         await post_message(
-            client, room_id,
+            client,
+            room_id,
             f"{mention_user} No unmirrored CloudCLI sessions found for #{agent_name}.",
             reply_to=event.event_id,
         )
         return
     insert_session(db, event.event_id, room_id, agent_name, session_id)
     await _register_session(
-        registry, session_id, agent_name, room_id, project_dir, scoped_mcp_url,
+        registry,
+        session_id,
+        agent_name,
+        room_id,
+        project_dir,
+        scoped_mcp_url,
     )
     response_event_id = await post_message(
-        client, room_id,
-        f"{mention_user} Linked session {session_id[:8]} to this thread. "
-        f"Reply here to resume.",
+        client,
+        room_id,
+        f"{mention_user} Linked session {session_id[:8]} to this thread. Reply here to resume.",
         reply_to=event.event_id,
     )
     register_alias(db, response_event_id, event.event_id)
@@ -868,6 +932,7 @@ async def handle_mirror_command(
 # ---------------------------------------------------------------------------
 # Retention cleanup
 # ---------------------------------------------------------------------------
+
 
 def run_cleanup(db: sqlite3.Connection, retention_days: int) -> tuple[int, int]:
     cutoff = int(time.time()) - retention_days * 86400
@@ -881,7 +946,9 @@ def run_cleanup(db: sqlite3.Connection, retention_days: int) -> tuple[int, int]:
     db.commit()
     log.info(
         "action=cleanup sessions_deleted=%d aliases_deleted=%d retention_days=%d",
-        sessions_deleted, aliases_deleted, retention_days,
+        sessions_deleted,
+        aliases_deleted,
+        retention_days,
     )
     return sessions_deleted, aliases_deleted
 
@@ -898,6 +965,7 @@ async def cleanup_loop(db: sqlite3.Connection, retention_days: int) -> None:
 # ---------------------------------------------------------------------------
 # HITL resume-on-approval reconcile loop (SMCP-38)
 # ---------------------------------------------------------------------------
+
 
 def _build_room_to_agent(config: dict) -> dict[str, dict]:
     """Map room_id → agent config (name + agent fields), as poll_loop does."""
@@ -936,13 +1004,14 @@ async def _resume_on_approval(
         # Room no longer configured — nothing to resume into. Drop the record.
         delete_pending_approval(db, approval_id)
         log.warning(
-            "action=hitl_resume_no_agent room=%s approval=%s", room_id, approval_id,
+            "action=hitl_resume_no_agent room=%s approval=%s",
+            room_id,
+            approval_id,
         )
         return
     agent_name = agent_cfg["name"]
     project_dir = agent_cfg["project_dir"]
     timeout = agent_cfg.get("subprocess_timeout_seconds", SUBPROCESS_TIMEOUT_SECONDS)
-    scoped_mcp_url = agent_cfg.get("scoped_mcp_url", "")
 
     # Claim first — exactly-once guarantee.
     delete_pending_approval(db, approval_id)
@@ -956,21 +1025,31 @@ async def _resume_on_approval(
     )
     log.info(
         "action=hitl_resume_start room=%s session=%s approval=%s",
-        room_id, session_id, approval_id,
+        room_id,
+        session_id,
+        approval_id,
     )
     async with _room_lock(room_id):
-        turn_start = datetime.now(timezone.utc)
+        turn_start = datetime.now(UTC)
         try:
             exit_code, output = await resume_claude(
-                session_id, nudge, project_dir, agent_name, room_id, timeout=timeout,
+                session_id,
+                nudge,
+                project_dir,
+                agent_name,
+                room_id,
+                timeout=timeout,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             log.error(
                 "action=hitl_resume_timeout room=%s session=%s approval=%s",
-                room_id, session_id, approval_id,
+                room_id,
+                session_id,
+                approval_id,
             )
             evt = await post_message(
-                client, room_id,
+                client,
+                room_id,
                 f"{mention_user} Session {session_id[:8]} timed out resuming after approval.",
                 reply_to=thread_root_id,
             )
@@ -983,10 +1062,13 @@ async def _resume_on_approval(
             # with the timeout path (audit LOW-1).
             log.exception(
                 "action=hitl_resume_failed room=%s session=%s approval=%s",
-                room_id, session_id, approval_id,
+                room_id,
+                session_id,
+                approval_id,
             )
             evt = await post_message(
-                client, room_id,
+                client,
+                room_id,
                 f"{mention_user} Session {session_id[:8]} failed to resume after approval "
                 f"(approval {approval_id}); please retry the request manually.",
                 reply_to=thread_root_id,
@@ -996,11 +1078,19 @@ async def _resume_on_approval(
         touch_session(db, thread_root_id)
         log.info(
             "action=hitl_resume_complete room=%s session=%s approval=%s exit_code=%d",
-            room_id, session_id, approval_id, exit_code,
+            room_id,
+            session_id,
+            approval_id,
+            exit_code,
         )
         await _post_response(
-            client, room_id, output, exit_code, session_id,
-            mention_user, max_message_length,
+            client,
+            room_id,
+            output,
+            exit_code,
+            session_id,
+            mention_user,
+            max_message_length,
             reply_target=thread_root_id,
             action="resume",
             db=db,
@@ -1008,7 +1098,13 @@ async def _resume_on_approval(
         )
         # A resumed-after-approval turn may itself hit another gate — track it too.
         await _record_pending_if_gated(
-            db, registry, agent_name, room_id, session_id, thread_root_id, turn_start,
+            db,
+            registry,
+            agent_name,
+            room_id,
+            session_id,
+            thread_root_id,
+            turn_start,
         )
 
 
@@ -1035,7 +1131,8 @@ async def reconcile_once(
             delete_pending_approval(db, row["approval_id"])
             log.info(
                 "action=hitl_pending_expired room=%s approval=%s",
-                row["room_id"], row["approval_id"],
+                row["room_id"],
+                row["approval_id"],
             )
         else:
             live.append(row)
@@ -1051,10 +1148,12 @@ async def reconcile_once(
             delete_pending_approval(db, row["approval_id"])
             log.info(
                 "action=hitl_denied_noresume room=%s approval=%s",
-                row["room_id"], row["approval_id"],
+                row["room_id"],
+                row["approval_id"],
             )
             evt = await post_message(
-                client, row["room_id"],
+                client,
+                row["room_id"],
                 f"{mention_user} Operator denied the pending request for "
                 f"`{row['tool_name'] or 'the tool'}`; not retrying.",
                 reply_to=row["thread_root_id"],
@@ -1124,27 +1223,49 @@ async def handle_event(
             await handle_help_command(client, room_id, event, mention_user)
         elif cmd == "!sessions":
             await handle_sessions_command(
-                client, room_id, event, mention_user, agent_name, project_dir, db,
+                client,
+                room_id,
+                event,
+                mention_user,
+                agent_name,
+                project_dir,
+                db,
             )
         elif cmd == "!recap":
             await handle_recap_command(
-                client, room_id, event, mention_user, project_dir, db,
-                max_message_length, arg,
+                client,
+                room_id,
+                event,
+                mention_user,
+                project_dir,
+                db,
+                max_message_length,
+                arg,
             )
         elif cmd == "!mirror":
             await handle_mirror_command(
-                client, room_id, event, mention_user, agent_name, project_dir, db,
-                registry=registry, scoped_mcp_url=scoped_mcp_url,
+                client,
+                room_id,
+                event,
+                mention_user,
+                agent_name,
+                project_dir,
+                db,
+                registry=registry,
+                scoped_mcp_url=scoped_mcp_url,
             )
         elif cmd == "!cancel":
             await handle_cancel_command(client, room_id, event, mention_user)
         else:
             log.info(
                 "action=command_unknown room=%s event_id=%s cmd=%s",
-                room_id, event.event_id, cmd[:20],
+                room_id,
+                event.event_id,
+                cmd[:20],
             )
             await post_message(
-                client, room_id,
+                client,
+                room_id,
                 f"{mention_user} Unknown command `{cmd}`. Send `!help` for the list.",
                 reply_to=event.event_id,
             )
@@ -1159,28 +1280,44 @@ async def handle_event(
             short_id = session_id[:8]
             log.info(
                 "action=resume_start room=%s event_id=%s agent=%s session=%s",
-                room_id, event.event_id, agent_name, session_id,
+                room_id,
+                event.event_id,
+                agent_name,
+                session_id,
             )
             ack_event_id = await post_message(
-                client, room_id, f"Resuming... (session {short_id})",
+                client,
+                room_id,
+                f"Resuming... (session {short_id})",
                 reply_to=event.event_id,
             )
             register_alias(db, ack_event_id, thread_root_id)
             await _register_session(
-                registry, session_id, agent_name, room_id, project_dir, scoped_mcp_url,
+                registry,
+                session_id,
+                agent_name,
+                room_id,
+                project_dir,
+                scoped_mcp_url,
             )
             async with _room_lock(room_id):
-                turn_start = datetime.now(timezone.utc)
+                turn_start = datetime.now(UTC)
                 try:
                     exit_code, output = await resume_claude(
-                        session_id, user_message, project_dir, agent_name, room_id,
+                        session_id,
+                        user_message,
+                        project_dir,
+                        agent_name,
+                        room_id,
                         timeout=subprocess_timeout_seconds,
                     )
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     log.error("action=resume_timeout room=%s session=%s", room_id, session_id)
                     timeout_event_id = await post_message(
-                        client, room_id,
-                        f"{mention_user} Session {short_id} timed out after {subprocess_timeout_seconds}s.",
+                        client,
+                        room_id,
+                        f"{mention_user} Session {short_id} timed out after "
+                        f"{subprocess_timeout_seconds}s.",
                         reply_to=ack_event_id or event.event_id,
                     )
                     register_alias(db, timeout_event_id, thread_root_id)
@@ -1188,18 +1325,31 @@ async def handle_event(
                 touch_session(db, thread_root_id)
                 log.info(
                     "action=resume_complete room=%s session=%s exit_code=%d",
-                    room_id, session_id, exit_code,
+                    room_id,
+                    session_id,
+                    exit_code,
                 )
                 await _post_response(
-                    client, room_id, output, exit_code, session_id,
-                    mention_user, max_message_length,
+                    client,
+                    room_id,
+                    output,
+                    exit_code,
+                    session_id,
+                    mention_user,
+                    max_message_length,
                     reply_target=ack_event_id or event.event_id,
                     action="resume",
                     db=db,
                     thread_root_id=thread_root_id,
                 )
                 await _record_pending_if_gated(
-                    db, registry, agent_name, room_id, session_id, thread_root_id, turn_start,
+                    db,
+                    registry,
+                    agent_name,
+                    room_id,
+                    session_id,
+                    thread_root_id,
+                    turn_start,
                 )
             return
         # Orphaned reply: thread root has no tracked session. Never spawn a new
@@ -1213,10 +1363,13 @@ async def handle_event(
             # a usable next step instead of silent nothing.
             log.info(
                 "action=expired_thread_reply room=%s event_id=%s thread_root=%s",
-                room_id, event.event_id, thread_root,
+                room_id,
+                event.event_id,
+                thread_root,
             )
             await post_message(
-                client, room_id,
+                client,
+                room_id,
                 f"{mention_user} No active session for that thread (it may have "
                 f"expired). Send a new message (not a reply) to start one, or "
                 f"`!sessions` to list recent ones.",
@@ -1228,7 +1381,10 @@ async def handle_event(
             # for that bot, not the dispatcher. Ignore silently; no room noise.
             log.info(
                 "action=foreign_reply_ignored room=%s event_id=%s thread_root=%s sender=%s",
-                room_id, event.event_id, thread_root, parent_sender or "unknown",
+                room_id,
+                event.event_id,
+                thread_root,
+                parent_sender or "unknown",
             )
         return
 
@@ -1243,10 +1399,13 @@ async def handle_event(
             remaining = int(RATE_LIMIT_SECONDS - (now - last))
             log.info(
                 "action=rate_limited room=%s event_id=%s remaining=%d",
-                room_id, event.event_id, remaining,
+                room_id,
+                event.event_id,
+                remaining,
             )
             await post_message(
-                client, room_id,
+                client,
+                room_id,
                 f"{mention_user} Rate-limited; try again in {remaining}s.",
                 reply_to=event.event_id,
             )
@@ -1257,16 +1416,27 @@ async def handle_event(
         short_id = session_id[:8]
         log.info(
             "action=spawn_start room=%s event_id=%s agent=%s session=%s",
-            room_id, event.event_id, agent_name, session_id,
+            room_id,
+            event.event_id,
+            agent_name,
+            session_id,
         )
         ack_event_id = await post_message(
-            client, room_id, f"Working... (session {short_id})", reply_to=event.event_id,
+            client,
+            room_id,
+            f"Working... (session {short_id})",
+            reply_to=event.event_id,
         )
         # Store session before spawning so thread replies can resume it even if spawn errors
         insert_session(db, event.event_id, room_id, agent_name, session_id)
         register_alias(db, ack_event_id, event.event_id)
         await _register_session(
-            registry, session_id, agent_name, room_id, project_dir, scoped_mcp_url,
+            registry,
+            session_id,
+            agent_name,
+            room_id,
+            project_dir,
+            scoped_mcp_url,
         )
 
         # The dispatcher owns all Matrix posting. Agents must NOT call any Matrix
@@ -1278,16 +1448,21 @@ async def handle_event(
             f"the dispatcher will post your stdout to the room automatically.]\n\n"
             f"{user_message}"
         )
-        turn_start = datetime.now(timezone.utc)
+        turn_start = datetime.now(UTC)
         try:
             exit_code, output = await spawn_claude(
-                session_id, prompt, project_dir, agent_name, room_id,
+                session_id,
+                prompt,
+                project_dir,
+                agent_name,
+                room_id,
                 timeout=subprocess_timeout_seconds,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             log.error("action=spawn_timeout room=%s session=%s", room_id, session_id)
             timeout_event_id = await post_message(
-                client, room_id,
+                client,
+                room_id,
                 f"{mention_user} Session {short_id} timed out after {subprocess_timeout_seconds}s.",
                 reply_to=ack_event_id or event.event_id,
             )
@@ -1295,24 +1470,38 @@ async def handle_event(
             return
         log.info(
             "action=spawn_complete room=%s session=%s exit_code=%d",
-            room_id, session_id, exit_code,
+            room_id,
+            session_id,
+            exit_code,
         )
         await _post_response(
-            client, room_id, output, exit_code, session_id,
-            mention_user, max_message_length,
+            client,
+            room_id,
+            output,
+            exit_code,
+            session_id,
+            mention_user,
+            max_message_length,
             reply_target=ack_event_id or event.event_id,
             action="spawn",
             db=db,
             thread_root_id=event.event_id,
         )
         await _record_pending_if_gated(
-            db, registry, agent_name, room_id, session_id, event.event_id, turn_start,
+            db,
+            registry,
+            agent_name,
+            room_id,
+            session_id,
+            event.event_id,
+            turn_start,
         )
 
 
 # ---------------------------------------------------------------------------
 # Polling loop
 # ---------------------------------------------------------------------------
+
 
 async def poll_loop(
     client: AsyncClient,
@@ -1375,23 +1564,25 @@ async def poll_loop(
                     # responses while subprocesses run. Per-room serialization
                     # is provided by _room_lock inside handle_event. This is
                     # what allows !cancel to actually fire mid-spawn.
-                    task = asyncio.create_task(handle_event(
-                        client=client,
-                        room_id=room_id,
-                        event=event,
-                        trusted_sender=trusted_sender,
-                        mention_user=mention_user,
-                        max_message_length=max_message_length,
-                        agent_name=agent_name,
-                        project_dir=project_dir,
-                        db=db,
-                        bot_user_id=bot_user_id,
-                        subprocess_timeout_seconds=agent_cfg.get(
-                            "subprocess_timeout_seconds", SUBPROCESS_TIMEOUT_SECONDS
-                        ),
-                        registry=registry,
-                        scoped_mcp_url=agent_cfg.get("scoped_mcp_url", ""),
-                    ))
+                    task = asyncio.create_task(
+                        handle_event(
+                            client=client,
+                            room_id=room_id,
+                            event=event,
+                            trusted_sender=trusted_sender,
+                            mention_user=mention_user,
+                            max_message_length=max_message_length,
+                            agent_name=agent_name,
+                            project_dir=project_dir,
+                            db=db,
+                            bot_user_id=bot_user_id,
+                            subprocess_timeout_seconds=agent_cfg.get(
+                                "subprocess_timeout_seconds", SUBPROCESS_TIMEOUT_SECONDS
+                            ),
+                            registry=registry,
+                            scoped_mcp_url=agent_cfg.get("scoped_mcp_url", ""),
+                        )
+                    )
                     _handlers.add(task)
                     task.add_done_callback(_handlers.discard)
 
@@ -1406,6 +1597,7 @@ async def poll_loop(
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
 
 async def main() -> None:
     homeserver, user_id, token = get_dispatcher_credentials()
@@ -1430,7 +1622,8 @@ async def main() -> None:
     if notify_room:
         try:
             await post_message(
-                client, notify_room,
+                client,
+                notify_room,
                 f"matrix-dispatcher started — agents: {list(agents_cfg.keys())}",
             )
         except Exception:
@@ -1449,10 +1642,8 @@ async def main() -> None:
     finally:
         for task in (cleanup_task, reconcile_task):
             task.cancel()
-            try:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
-            except (asyncio.CancelledError, Exception):
-                pass
         await registry.close()
         # Send SIGTERM to any active subprocesses so handlers can complete
         # naturally instead of leaving orphans.
@@ -1467,9 +1658,10 @@ async def main() -> None:
         if _handlers:
             try:
                 await asyncio.wait_for(
-                    asyncio.gather(*_handlers, return_exceptions=True), timeout=10,
+                    asyncio.gather(*_handlers, return_exceptions=True),
+                    timeout=10,
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 log.warning("action=shutdown_handlers_timeout outstanding=%d", len(_handlers))
         db.close()
         await client.close()

@@ -2,7 +2,39 @@
 
 ## [Unreleased]
 
-## [0.6.0] - 2026-07-18
+## [0.7.0] - 2026-07-18
+
+Monolith split — the flat ~1.7k-line `dispatcher.py` is now a `src/matrix_dispatcher/`
+package. Pure structural refactor: **no runtime behaviour change**, guarded by the
+existing ~98% test suite. Also folds in one pre-existing retention bug surfaced by the
+build's security audit (128 tests passing, coverage held at parity).
+
+### Fixed
+- **Retention cleanup no longer fails with `FOREIGN KEY constraint failed`.**
+  `run_cleanup` deleted `sessions` rows before the `event_aliases` rows that reference
+  them; with FK enforcement on (as `open_db` sets) and no `ON DELETE CASCADE`, this
+  raised `sqlite3.IntegrityError` for any session that had ever had an alias registered
+  — i.e. effectively every session — so 30-day retention silently never ran
+  (`cleanup_loop`) or exited non-zero (`--cleanup`). Referenced aliases are now deleted
+  first, then the sessions, then any orphaned aliases are swept. Pre-existing bug (not
+  introduced by the split); found by the monolith-split audit and verified fixed against
+  a copy of the live DB. The test `db` fixture now enables `PRAGMA foreign_keys=ON` to
+  match production, turning the retention tests into a real regression guard.
+
+### Changed
+- **Public import paths changed.** The daemon is now the `matrix_dispatcher` package
+  under `src/` (src-layout), split into focused modules along a strict downward import
+  DAG: `config` ← `db`/`transcripts` ← `matrixio` ← `runner` ← `hitl` ← `commands` ←
+  `app`. Import from `matrix_dispatcher.*` (e.g. `from matrix_dispatcher.app import
+  main`) rather than the former top-level `dispatcher` / `agent_registry` modules
+  (`agent_registry.py` → `matrix_dispatcher.registry`).
+- Root `dispatcher.py` is now a thin **entry shim** that prepends `src/` to `sys.path`
+  and execs the package, so the live PM2 service keeps working with **zero deploy
+  change**. Added a `matrix-dispatcher` console script and `python -m matrix_dispatcher`
+  entry (`matrix_dispatcher.__main__`).
+- `pyproject.toml` builds the package (`packages = ["src/matrix_dispatcher"]`); coverage
+  source and CI mypy target retargeted to the package; `_post_response` moved into
+  `matrixio` (from the former command layer) to keep the import graph acyclic.
 
 Showcase-tier promotion + public-history security remediation.
 

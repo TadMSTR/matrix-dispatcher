@@ -9,9 +9,19 @@ Listens to Matrix rooms via matrix-nio, spawns a `claude -p` subprocess per room
 ## Structure
 
 ```
-dispatcher.py                  Main bot — matrix-nio client, per-room concurrency lock,
-                               rate limiter, SQLite session tracking, subprocess management
-agent_registry.py              Fail-open agent-postgres client (HITL resume-on-approval)
+dispatcher.py                  Entry shim — prepends src/ to sys.path and execs the package.
+                               The live PM2 service runs this file; do NOT delete it.
+src/matrix_dispatcher/         Daemon package (src-layout). Import DAG points downward:
+  config.py                    Constants, logging, paths, load_config
+  db.py                        SQLite layer (parameterized queries throughout)
+  transcripts.py               claude -p JSONL transcript readers
+  matrixio.py                  Matrix posting/chunking/thread-root, credentials, _post_response
+  runner.py                    Subprocess spawn/resume, runtime state (locks/procs), !cancel
+  commands.py                  !help / !sessions / !recap / !mirror handlers
+  hitl.py                      HITL resume-on-approval (SMCP-38) + reconcile loop
+  registry.py                  Fail-open agent-postgres client (HITL resume-on-approval)
+  app.py                       Orchestration: handle_event, poll/cleanup loops, main
+  __main__.py                  Console-script / python -m entry
 config.yml                     Active config (gitignored — see config.example.yml)
 config.example.yml             Reference configuration
 ecosystem.config.js            PM2 config (portable — no hardcoded paths)
@@ -36,7 +46,7 @@ deploy repo and are gitignored here (`*.forge.*`, `*-forge.*`).
 - **HITL resume-on-approval reconcile loop** (SMCP-38, v0.5.0) — a background task
   (`RECONCILE_INTERVAL_SECONDS = 10`) polls the local `pending_approvals` SQLite table
   (rows written when a turn ends with an approval still pending) and cross-checks each
-  against `hitl_approvals` state on agent-postgres via `agent_registry.py`. On `approved`
+  against `hitl_approvals` state on agent-postgres via `registry.py`. On `approved`
   it `claude -p --resume`s the originating session; on `denied` it posts a note; rows
   older than 2× the HITL timeout (600s) are expired. **Claim-then-act**: the local row is
   deleted *before* the resume fires, so an overlapping reconcile pass or a restart
@@ -54,7 +64,7 @@ Config lives in `config.yml` (gitignored). `config.example.yml` is the reference
 registry, e.g. `postgresql://dispatcher_registry:***@127.0.0.1:5433/agent_registry`.
 Provisioned in the PM2 env from Vault, not `config.yml`. Unset ⇒ HITL resume-on-approval is
 off and the dispatcher behaves exactly as before this feature (fail-open by design — see
-`agent_registry.py`). Each agent entry in `config.yml` also accepts an optional
+`registry.py`). Each agent entry in `config.yml` also accepts an optional
 `scoped_mcp_url` (e.g. `http://127.0.0.1:8471`), a best-effort value recorded in the
 `sessions` registry row for that agent; it is not on the resume hot path and can be omitted.
 
@@ -62,7 +72,7 @@ off and the dispatcher behaves exactly as before this feature (fail-open by desi
 
 **Add a new Matrix room** — add it to `config.yml` and ensure the bot account has been invited to the room.
 
-**Change rate limit or concurrency** — edit the relevant constants in `dispatcher.py`; they are not yet externalized to config.
+**Change rate limit or concurrency** — edit the relevant constants in `src/matrix_dispatcher/config.py`; they are not yet externalized to config.
 
 **Debug a stuck session** — check `sessions.db` for orphaned rows with no exit code, then locate the subprocess PID and inspect or kill it manually.
 
@@ -78,7 +88,7 @@ end-to-end.
 ```bash
 pip install -e '.[dev]'
 ruff check . && ruff format --check .
-mypy dispatcher.py agent_registry.py
+mypy src
 pytest --cov --cov-report=term-missing
 ```
 

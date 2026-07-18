@@ -98,7 +98,7 @@ An *availability* feature layered on top of a fail-**closed** gate (scoped-mcp's
 Dragonfly OTP). It is **fail-open**: if agent-postgres is unreachable, the feature simply
 doesn't fire and the operator falls back to manual retry — never a bypass. Disabled
 entirely unless `AGENT_REGISTRY_DSN` is set (resolved from Vault first via a one-shot
-AppRole read, then a plaintext env fallback — see `agent_registry.py`).
+AppRole read, then a plaintext env fallback — see `registry.py`).
 
 Flow:
 
@@ -115,7 +115,7 @@ Flow:
    resume nudge carries **no secret** (no OTP, no token): the agent must retry the exact
    same tool call, and the pre-approval token is bound to `(tool, args_hash)`.
 
-`agent_registry.py` is a small, deliberately duplicated fail-open asyncpg client (every
+`registry.py` is a small, deliberately duplicated fail-open asyncpg client (every
 method no-ops when the pool is `None` and swallows DB errors) rather than a shared
 installable — the dispatcher and scoped-mcp touch disjoint subsets of the frozen
 migration-0001 schema.

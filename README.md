@@ -170,16 +170,26 @@ for the DB schema, dispatch flow, and subprocess/env model.
 
 ```
 matrix-dispatcher/
-├── dispatcher.py       # main daemon
-├── agent_registry.py   # fail-open agent-postgres client (HITL resume-on-approval)
-├── config.yml          # live config (not committed — contains room IDs)
-├── config.example.yml  # committed template
-├── pyproject.toml      # build + pinned deps + ruff/mypy/pytest/coverage config
-├── ecosystem.config.js # PM2 definition (uses start.sh)
-├── start.sh            # sources credentials env file, execs dispatcher
-├── tests/              # pytest suite (async, ~98% coverage)
-├── .github/workflows/  # CI + source-only release
-└── venv/               # local venv
+├── dispatcher.py           # entry shim — execs the package (keeps the live service working)
+├── src/matrix_dispatcher/  # the daemon package (src-layout)
+│   ├── __main__.py         #   console-script / `python -m matrix_dispatcher` entry
+│   ├── app.py              #   orchestration: handle_event, poll/cleanup loops, main
+│   ├── config.py           #   constants, logging, paths, load_config
+│   ├── db.py               #   SQLite layer (sessions, aliases, poll_state, pending_approvals)
+│   ├── transcripts.py      #   JSONL transcript readers (!sessions/!recap/!mirror)
+│   ├── matrixio.py         #   Matrix posting, chunking, thread-root, credentials
+│   ├── runner.py           #   subprocess spawn/resume, runtime state, !cancel
+│   ├── commands.py         #   !help/!sessions/!recap/!mirror handlers
+│   ├── hitl.py             #   HITL resume-on-approval (SMCP-38) + reconcile loop
+│   └── registry.py         #   fail-open agent-postgres client (HITL resume-on-approval)
+├── config.yml              # live config (not committed — contains room IDs)
+├── config.example.yml      # committed template
+├── pyproject.toml          # build + pinned deps + ruff/mypy/pytest/coverage config
+├── ecosystem.config.js     # PM2 definition (uses start.sh)
+├── start.sh                # sources credentials env file, execs dispatcher
+├── tests/                  # pytest suite (async, ~98% coverage)
+├── .github/workflows/      # CI + source-only release
+└── venv/                   # local venv
 ~/.claude/data/matrix-dispatcher/
 └── sessions.db         # SQLite (sessions, event_aliases, poll_state)
 ~/.claude-secrets/

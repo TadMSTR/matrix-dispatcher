@@ -14,7 +14,7 @@ import types
 
 import pytest
 
-import agent_registry
+import matrix_dispatcher.registry as agent_registry
 
 
 @pytest.fixture(autouse=True)

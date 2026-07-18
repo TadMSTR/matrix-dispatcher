@@ -12,7 +12,9 @@ from types import SimpleNamespace
 
 import pytest
 
-import dispatcher
+import matrix_dispatcher.app as dispatcher
+import matrix_dispatcher.runner as runner
+import matrix_dispatcher.transcripts as transcripts
 
 TRUSTED = "@admin:example.org"
 BOT = "@dispatcher-bot:example.org"
@@ -102,8 +104,8 @@ def _clean_runtime_state():
 def spies(monkeypatch):
     spawn = Spy()
     resume = Spy()
-    monkeypatch.setattr(dispatcher, "spawn_claude", spawn)
-    monkeypatch.setattr(dispatcher, "resume_claude", resume)
+    monkeypatch.setattr(runner, "spawn_claude", spawn)
+    monkeypatch.setattr(runner, "resume_claude", resume)
     return SimpleNamespace(spawn=spawn, resume=resume)
 
 
@@ -214,7 +216,7 @@ async def test_sessions_command_empty(db):
 
 
 async def test_sessions_command_lists_and_aliases(db, monkeypatch):
-    monkeypatch.setattr(dispatcher, "read_first_user_message", lambda *a, **k: "summary")
+    monkeypatch.setattr(transcripts, "read_first_user_message", lambda *a, **k: "summary")
     dispatcher.insert_session(db, "$r1", ROOM, AGENT, "sess-1111aaaa")
     dispatcher.insert_session(db, "$r2", ROOM, AGENT, "sess-2222bbbb")
     client = FakeClient()
@@ -235,7 +237,7 @@ async def test_recap_command_no_session(db):
 
 
 async def test_recap_command_no_turns(db, monkeypatch):
-    monkeypatch.setattr(dispatcher, "read_last_n_turns", lambda *a, **k: "")
+    monkeypatch.setattr(transcripts, "read_last_n_turns", lambda *a, **k: "")
     dispatcher.insert_session(db, "$r1", ROOM, AGENT, "sess-1111aaaa")
     client = FakeClient()
     ev = make_event(TRUSTED, "!recap 3", "$e")
@@ -244,7 +246,7 @@ async def test_recap_command_no_turns(db, monkeypatch):
 
 
 async def test_recap_command_with_turns(db, monkeypatch):
-    monkeypatch.setattr(dispatcher, "read_last_n_turns", lambda *a, **k: "**user:**\nhi")
+    monkeypatch.setattr(transcripts, "read_last_n_turns", lambda *a, **k: "**user:**\nhi")
     dispatcher.insert_session(db, "$r1", ROOM, AGENT, "sess-1111aaaa")
     client = FakeClient()
     ev = make_event(TRUSTED, "!recap", "$e")
@@ -253,7 +255,7 @@ async def test_recap_command_with_turns(db, monkeypatch):
 
 
 async def test_mirror_command_not_found(db, monkeypatch):
-    monkeypatch.setattr(dispatcher, "find_unmirrored_session_id", lambda *a, **k: None)
+    monkeypatch.setattr(transcripts, "find_unmirrored_session_id", lambda *a, **k: None)
     client = FakeClient()
     ev = make_event(TRUSTED, "!mirror", "$e")
     await dispatcher.handle_mirror_command(client, ROOM, ev, MENTION, AGENT, PROJECT, db)
@@ -262,7 +264,7 @@ async def test_mirror_command_not_found(db, monkeypatch):
 
 async def test_mirror_command_links_session(db, monkeypatch):
     sid = "11111111-2222-3333-4444-555555555555"
-    monkeypatch.setattr(dispatcher, "find_unmirrored_session_id", lambda *a, **k: sid)
+    monkeypatch.setattr(transcripts, "find_unmirrored_session_id", lambda *a, **k: sid)
     client = FakeClient()
     ev = make_event(TRUSTED, "!mirror", "$mir")
     await dispatcher.handle_mirror_command(client, ROOM, ev, MENTION, AGENT, PROJECT, db)
@@ -333,7 +335,7 @@ async def test_route_recap(db, spies):
 
 
 async def test_route_mirror(db, spies, monkeypatch):
-    monkeypatch.setattr(dispatcher, "find_unmirrored_session_id", lambda *a, **k: None)
+    monkeypatch.setattr(transcripts, "find_unmirrored_session_id", lambda *a, **k: None)
     client = FakeClient()
     await _dispatch(client, make_event(TRUSTED, "!mirror", "$e"), db)
     assert "No unmirrored" in client.sent[0]["body"]
@@ -350,7 +352,7 @@ async def test_resume_timeout_posts_notice(db, monkeypatch):
     async def timeout(*a, **k):
         raise TimeoutError()
 
-    monkeypatch.setattr(dispatcher, "resume_claude", timeout)
+    monkeypatch.setattr(runner, "resume_claude", timeout)
     client = FakeClient()
     ev = make_event(TRUSTED, "continue", "$reply", reply_to="$root")
     await _dispatch(client, ev, db)
@@ -361,7 +363,7 @@ async def test_spawn_timeout_posts_notice(db, monkeypatch):
     async def timeout(*a, **k):
         raise TimeoutError()
 
-    monkeypatch.setattr(dispatcher, "spawn_claude", timeout)
+    monkeypatch.setattr(runner, "spawn_claude", timeout)
     client = FakeClient()
     ev = make_event(TRUSTED, "do a thing", "$root")
     await _dispatch(client, ev, db)

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "matrix-dispatcher"
-version = "0.6.0"
+version = "0.7.0"
 description = "Spawn or resume `claude -p` agent sessions from Matrix room messages."
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -35,10 +35,13 @@ dev = [
   "pip-audit==2.10.1",
 ]
 
-# Flat-module service (monolith split is a deferred follow-up). Ship the two
-# top-level modules explicitly so `pip install -e '.[dev]'` works in CI.
+# src-layout package (monolith split completed in v0.7.0). The root dispatcher.py
+# is a runtime entry shim, not part of the wheel.
 [tool.hatch.build.targets.wheel]
-include = ["dispatcher.py", "agent_registry.py"]
+packages = ["src/matrix_dispatcher"]
+
+[project.scripts]
+matrix-dispatcher = "matrix_dispatcher.__main__:main"
 
 [tool.ruff]
 line-length = 100
@@ -53,7 +56,7 @@ asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 
 [tool.coverage.run]
-source = ["dispatcher", "agent_registry"]
+source = ["matrix_dispatcher"]
 omit = ["tests/*"]
 
 [tool.coverage.report]
@@ -62,6 +65,7 @@ show_missing = true
 exclude_lines = [
   "pragma: no cover",
   "if __name__ == .__main__.:",
+  "if TYPE_CHECKING:",
   "raise NotImplementedError",
 ]
 

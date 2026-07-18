@@ -16,7 +16,8 @@ from types import SimpleNamespace
 
 import pytest
 
-import dispatcher
+import matrix_dispatcher.app as dispatcher
+import matrix_dispatcher.runner as runner
 
 TRUSTED = "@admin:example.org"
 MENTION = "@ted"
@@ -119,8 +120,8 @@ def db():
 def spies(monkeypatch):
     spawn = Spy()
     resume = Spy()
-    monkeypatch.setattr(dispatcher, "spawn_claude", spawn)
-    monkeypatch.setattr(dispatcher, "resume_claude", resume)
+    monkeypatch.setattr(runner, "spawn_claude", spawn)
+    monkeypatch.setattr(runner, "resume_claude", resume)
     dispatcher._last_spawn_at.clear()
     return SimpleNamespace(spawn=spawn, resume=resume)
 
@@ -320,7 +321,7 @@ async def test_reconcile_resume_failure_notifies(db, spies, monkeypatch):
     async def boom(*args, **kwargs):
         raise OSError("claude binary transiently missing")
 
-    monkeypatch.setattr(dispatcher, "resume_claude", boom)
+    monkeypatch.setattr(runner, "resume_claude", boom)
 
     await dispatcher.reconcile_once(client, db, CONFIG, room_to_agent, reg)
 

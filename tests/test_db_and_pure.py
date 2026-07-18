@@ -15,7 +15,8 @@ from types import SimpleNamespace
 
 import pytest
 
-import dispatcher
+import matrix_dispatcher.app as dispatcher
+import matrix_dispatcher.config as config
 
 
 @pytest.fixture
@@ -37,13 +38,13 @@ def db():
 def test_load_config_reads_yaml(tmp_path, monkeypatch):
     cfg = tmp_path / "config.yml"
     cfg.write_text("homeserver: https://h\nagents: {}\n")
-    monkeypatch.setattr(dispatcher, "CONFIG_PATH", cfg)
+    monkeypatch.setattr(config, "CONFIG_PATH", cfg)
     assert dispatcher.load_config()["homeserver"] == "https://h"
 
 
 def test_open_db_creates_file_and_pragmas(tmp_path, monkeypatch):
     db_path = tmp_path / "data" / "sessions.db"
-    monkeypatch.setattr(dispatcher, "DB_PATH", db_path)
+    monkeypatch.setattr(config, "DB_PATH", db_path)
     conn = dispatcher.open_db()
     try:
         assert db_path.exists()
@@ -70,7 +71,7 @@ def test_get_set_since_roundtrip(db):
 
 
 def test_migrate_v1_tokens_no_file_noop(tmp_path, monkeypatch, db):
-    monkeypatch.setattr(dispatcher, "POLL_TOKEN_PATH", tmp_path / "absent.json")
+    monkeypatch.setattr(config, "POLL_TOKEN_PATH", tmp_path / "absent.json")
     dispatcher.migrate_v1_tokens(db)
     assert dispatcher.get_since(db) is None
 
@@ -78,7 +79,7 @@ def test_migrate_v1_tokens_no_file_noop(tmp_path, monkeypatch, db):
 def test_migrate_v1_tokens_imports_and_unlinks(tmp_path, monkeypatch, db):
     tok = tmp_path / "poll-tokens.json"
     tok.write_text(json.dumps({"global_since": "batch-xyz"}))
-    monkeypatch.setattr(dispatcher, "POLL_TOKEN_PATH", tok)
+    monkeypatch.setattr(config, "POLL_TOKEN_PATH", tok)
     dispatcher.migrate_v1_tokens(db)
     assert dispatcher.get_since(db) == "batch-xyz"
     assert not tok.exists()  # consumed
@@ -87,7 +88,7 @@ def test_migrate_v1_tokens_imports_and_unlinks(tmp_path, monkeypatch, db):
 def test_migrate_v1_tokens_bad_json_is_skipped(tmp_path, monkeypatch, db):
     tok = tmp_path / "poll-tokens.json"
     tok.write_text("{not json")
-    monkeypatch.setattr(dispatcher, "POLL_TOKEN_PATH", tok)
+    monkeypatch.setattr(config, "POLL_TOKEN_PATH", tok)
     dispatcher.migrate_v1_tokens(db)  # must not raise
     assert dispatcher.get_since(db) is None
 

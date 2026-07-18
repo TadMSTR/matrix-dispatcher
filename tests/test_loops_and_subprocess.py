@@ -16,7 +16,10 @@ from types import SimpleNamespace
 
 import pytest
 
-import dispatcher
+import matrix_dispatcher.app as dispatcher
+import matrix_dispatcher.config as config
+import matrix_dispatcher.hitl as hitl
+import matrix_dispatcher.runner as runner
 
 ROOM = "!room:example.org"
 AGENT = "sysadmin"
@@ -122,7 +125,7 @@ async def test_spawn_and_resume_compose_argv(monkeypatch):
         seen["args"] = args
         return (0, "ok")
 
-    monkeypatch.setattr(dispatcher, "_run_claude", fake_run)
+    monkeypatch.setattr(runner, "_run_claude", fake_run)
     await dispatcher.spawn_claude("sid", "prompt", "/tmp", AGENT, ROOM)
     assert seen["args"] == ["claude", "-p", "--session-id", "sid", "prompt"]
     await dispatcher.resume_claude("sid", "msg", "/tmp", AGENT, ROOM)
@@ -171,8 +174,8 @@ def test_read_last_n_turns_skips_bad_json_and_handles_oserror(monkeypatch, tmp_p
 
 
 async def test_cancel_waits_for_registration_then_noops(monkeypatch):
-    monkeypatch.setattr(dispatcher, "CANCEL_REGISTRATION_WAIT_SECONDS", 0.05)
-    monkeypatch.setattr(dispatcher, "CANCEL_POLL_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(config, "CANCEL_REGISTRATION_WAIT_SECONDS", 0.05)
+    monkeypatch.setattr(config, "CANCEL_POLL_INTERVAL_SECONDS", 0.01)
     lock = dispatcher._room_lock(ROOM)
     await lock.acquire()  # simulate spawn in-flight, proc not yet registered
     try:
@@ -191,7 +194,7 @@ async def test_cancel_waits_for_registration_then_noops(monkeypatch):
 
 async def test_resume_on_approval_unconfigured_room_drops(db, monkeypatch):
     resume = _Spy()
-    monkeypatch.setattr(dispatcher, "resume_claude", resume)
+    monkeypatch.setattr(runner, "resume_claude", resume)
     other_room = "!gone:example.org"
     dispatcher.insert_session(db, "$r", other_room, AGENT, "sess-x")
     dispatcher.insert_pending_approval(db, "sysadmin.a", "$r", "sess-x", other_room, "tool")
@@ -208,7 +211,7 @@ async def test_resume_on_approval_timeout_notifies(db, monkeypatch):
     async def timeout(*a, **k):
         raise TimeoutError()
 
-    monkeypatch.setattr(dispatcher, "resume_claude", timeout)
+    monkeypatch.setattr(runner, "resume_claude", timeout)
     dispatcher.insert_session(db, "$r", ROOM, AGENT, "sess-y")
     dispatcher.insert_pending_approval(db, "sysadmin.b", "$r", "sess-y", ROOM, "tool")
     reg = _EnabledStates({"sysadmin.b": "approved"})
@@ -297,7 +300,7 @@ async def test_reconcile_loop_enabled_iterates_then_cancelled(db, monkeypatch):
     async def cancel_sleep(_):
         raise asyncio.CancelledError()
 
-    monkeypatch.setattr(dispatcher, "reconcile_once", fake_once)
+    monkeypatch.setattr(hitl, "reconcile_once", fake_once)
     monkeypatch.setattr(dispatcher.asyncio, "sleep", cancel_sleep)
     with pytest.raises(asyncio.CancelledError):
         await dispatcher.reconcile_loop(FakeClient(), CONFIG, db, FakeRegistry(enabled=True))
@@ -311,7 +314,7 @@ async def test_reconcile_loop_swallows_iteration_error(db, monkeypatch):
     async def cancel_sleep(_):
         raise asyncio.CancelledError()
 
-    monkeypatch.setattr(dispatcher, "reconcile_once", boom)
+    monkeypatch.setattr(hitl, "reconcile_once", boom)
     monkeypatch.setattr(dispatcher.asyncio, "sleep", cancel_sleep)
     with pytest.raises(asyncio.CancelledError):
         await dispatcher.reconcile_loop(FakeClient(), CONFIG, db, FakeRegistry(enabled=True))

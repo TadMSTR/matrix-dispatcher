@@ -15,7 +15,8 @@ from types import SimpleNamespace
 
 import pytest
 
-import dispatcher
+import matrix_dispatcher.app as dispatcher
+import matrix_dispatcher.runner as runner
 
 TRUSTED = "@admin:example.org"
 BOT_USER_ID = "@dispatcher-bot:example.org"
@@ -118,8 +119,8 @@ def db():
 def spies(monkeypatch):
     spawn = Spy()
     resume = Spy()
-    monkeypatch.setattr(dispatcher, "spawn_claude", spawn)
-    monkeypatch.setattr(dispatcher, "resume_claude", resume)
+    monkeypatch.setattr(runner, "spawn_claude", spawn)
+    monkeypatch.setattr(runner, "resume_claude", resume)
     # Clear per-room rate-limit state so spawn tests aren't throttled.
     dispatcher._last_spawn_at.clear()
     return SimpleNamespace(spawn=spawn, resume=resume)

@@ -13,7 +13,7 @@ from datetime import UTC
 
 import pytest
 
-import agent_registry
+import matrix_dispatcher.registry as agent_registry
 
 # --------------------------------------------------------------------------- #
 # Fake asyncpg pool / connection

@@ -25,9 +25,8 @@ Showcase-tier promotion + public-history security remediation.
   in `pyproject.toml`).
 
 ### Fixed
-- Genericized a test fixture that embedded a real host path
-  (`/home/ted/.claude/projects/sysadmin`) introduced during the coverage lift — resolves
-  the Showcase-audit LOW finding.
+- Genericized a test fixture that embedded a real host path (operator username + agent
+  name) introduced during the coverage lift — resolves the Showcase-audit LOW finding.
 
 ### Security
 - **Purged leaked forge topology from all public git history** (`git filter-repo` +

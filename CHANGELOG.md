@@ -2,6 +2,28 @@
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-07-18
+
+### Added
+- `AGENT_REGISTRY_DSN` is now read from Vault first (SMCP-42), via a one-shot
+  AppRole login-read-discard against the `dispatcher-registry-reader` role
+  (new `hvac` dependency, optional-import — falls back cleanly if unset or
+  unavailable). The existing plaintext `AGENT_REGISTRY_DSN` env var remains
+  the fail-open fallback, used unconditionally if Vault is unconfigured or
+  the read fails for any reason (network, auth, missing key). Does not port
+  scoped-mcp's renewal-loop machinery — this DSN is read once at first use,
+  not held as a long-lived credential.
+
+### Changed
+- `requirements.txt` adds `hvac==2.4.0`.
+
+### Security
+- Pre-merge audit: 1 Info finding (Vault AppRole reader token not explicitly
+  revoked after the one-shot read) — fixed by calling
+  `client.auth.token.revoke_self()` immediately after a successful read,
+  guarded so a revoke failure can never turn a successful DSN read into a
+  failure. No security bypass; audit clean otherwise.
+
 ## [0.5.0] - 2026-07-17
 
 ### Added

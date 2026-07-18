@@ -204,12 +204,75 @@ async def _build_pool(dsn: str) -> Any | None:
         return None
 
 
+# SMCP-42: Vault-backed AGENT_REGISTRY_DSN, read once at get_registry()'s first
+# call via a dedicated dispatcher-registry-reader AppRole. This is deliberately
+# NOT a port of scoped-mcp's credentials_vault.py renewal-loop machinery — that
+# exists because scoped-mcp holds a long-lived Vault token across the process
+# lifetime. This is a single login-read-discard: the client and its token fall
+# out of scope as soon as the DSN is extracted, no background renewal task.
+_VAULT_ROLE_ID_ENV = "DISPATCHER_REGISTRY_VAULT_ROLE_ID"
+_VAULT_SECRET_ID_ENV = "DISPATCHER_REGISTRY_VAULT_SECRET_ID"
+_VAULT_KV_PATH = "agents/shared"  # secret/agents/shared, key AGENT_REGISTRY_DSN (SMCP-40 backfill)
+
+
+def _vault_configured() -> bool:
+    return bool(
+        os.environ.get("VAULT_ADDR", "").strip()
+        and os.environ.get(_VAULT_ROLE_ID_ENV, "").strip()
+        and os.environ.get(_VAULT_SECRET_ID_ENV, "").strip()
+    )
+
+
+def _read_dsn_from_vault_sync() -> str | None:
+    """One-shot AppRole login + KV-v2 read for AGENT_REGISTRY_DSN.
+
+    Best-effort and fail-open: a missing ``hvac``, missing env, network error,
+    auth failure, or missing key all return ``None`` so the caller falls back to
+    the plaintext ``AGENT_REGISTRY_DSN`` env var. Synchronous (hvac has no async
+    client) — callers must run this via ``asyncio.to_thread``.
+    """
+    try:
+        import hvac  # local import — optional runtime dep, mirrors credentials_vault.py
+    except ImportError:
+        log.warning("action=vault_registry_dsn_disabled_missing_dep detail=hvac-not-installed")
+        return None
+
+    addr = os.environ.get("VAULT_ADDR", "").strip()
+    role_id = os.environ.get(_VAULT_ROLE_ID_ENV, "").strip()
+    secret_id = os.environ.get(_VAULT_SECRET_ID_ENV, "").strip()
+    try:
+        client = hvac.Client(url=addr)
+        client.auth.approle.login(role_id=role_id, secret_id=secret_id)
+        resp = client.secrets.kv.v2.read_secret_version(path=_VAULT_KV_PATH)
+        dsn = resp["data"]["data"].get("AGENT_REGISTRY_DSN", "")
+        if not dsn:
+            log.warning("action=vault_registry_dsn_missing_key path=%s", _VAULT_KV_PATH)
+            return None
+        # SECURITY[control]: this is a one-shot reader token with no other consumer —
+        # revoke it server-side now rather than leaving it valid for its full TTL.
+        # Best-effort: a revoke failure must not turn a successful DSN read into a
+        # failure, so it's caught separately from the read itself.
+        # Audit: 2026-07-18/hitl-alias-resolution-and-vault-wiring-2026-07.
+        try:
+            client.auth.token.revoke_self()
+        except Exception as e:
+            log.warning("action=vault_registry_token_revoke_failed err=%s", type(e).__name__)
+        return dsn
+    except Exception as e:  # fail-open — a down/misconfigured Vault must never stop the Matrix loop
+        log.warning("action=vault_registry_dsn_read_failed err=%s", type(e).__name__)
+        return None
+
+
 async def get_registry() -> RegistryClient:
     """Return the process-wide registry client, building the pool on first use.
 
     Always returns a :class:`RegistryClient`: a disabled one (``pool=None``) when
-    ``AGENT_REGISTRY_DSN`` is unset or the pool cannot be built, so callers can
-    invoke methods unconditionally.
+    no DSN is available or the pool cannot be built, so callers can invoke
+    methods unconditionally.
+
+    DSN resolution order: Vault (if ``VAULT_ADDR`` + the dispatcher-registry-reader
+    AppRole env vars are set) first, then the plaintext ``AGENT_REGISTRY_DSN`` env
+    var — unchanged fail-open fallback if Vault is unconfigured or unreachable.
     """
     global _registry, _init_lock
     if _registry is not None:
@@ -219,7 +282,15 @@ async def get_registry() -> RegistryClient:
     async with _init_lock:
         if _registry is not None:  # lost the race
             return _registry
-        dsn = os.environ.get("AGENT_REGISTRY_DSN", "").strip()
+        dsn = ""
+        if _vault_configured():
+            dsn = await asyncio.to_thread(_read_dsn_from_vault_sync) or ""
+            if dsn:
+                log.info("action=registry_dsn_source_vault")
+        if not dsn:
+            dsn = os.environ.get("AGENT_REGISTRY_DSN", "").strip()
+            if dsn:
+                log.info("action=registry_dsn_source_env_fallback")
         pool = await _build_pool(dsn) if dsn else None
         if dsn and pool is None:
             log.warning("action=registry_enabled_but_unavailable")

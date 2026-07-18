@@ -25,6 +25,10 @@ def db():
 
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
+    # Match production (open_db enables this): without FK enforcement the retention
+    # cleanup ordering bug is invisible to tests — this parity is what makes
+    # test_run_cleanup_* a real regression guard for the event_aliases FK.
+    conn.execute("PRAGMA foreign_keys=ON")
     dispatcher.init_db(conn)
     yield conn
     conn.close()
@@ -381,3 +385,32 @@ def test_run_cleanup_deletes_old_sessions_and_orphan_aliases(db):
     assert aliases_deleted == 1  # the orphaned alias for the purged session
     assert dispatcher.get_session(db, "$old") is None
     assert dispatcher.get_session(db, "$fresh") is not None
+
+
+def test_run_cleanup_deletes_referenced_aliases_before_sessions(db):
+    """Regression: run_cleanup must not raise FOREIGN KEY constraint failed.
+
+    event_aliases.thread_root_id REFERENCES sessions(thread_root_id) with no cascade;
+    an expiring session with one or more registered aliases previously aborted the
+    whole DELETE (IntegrityError) so retention never ran. With FK enforcement on
+    (see the db fixture) this test fails against the pre-fix ordering.
+    """
+    now = int(time.time())
+    dispatcher.insert_session(db, "$old", "!r:example.org", "sysadmin", "s-old")
+    # An expiring session typically has several aliases (ack + each response chunk).
+    dispatcher.register_alias(db, "$ack", "$old")
+    dispatcher.register_alias(db, "$chunk1", "$old")
+    dispatcher.register_alias(db, "$chunk2", "$old")
+    db.execute(
+        "UPDATE sessions SET last_used_at = ? WHERE thread_root_id = '$old'",
+        (now - 40 * 86400,),
+    )
+    db.commit()
+
+    # Must not raise sqlite3.IntegrityError.
+    sessions_deleted, aliases_deleted = dispatcher.run_cleanup(db, retention_days=30)
+
+    assert sessions_deleted == 1
+    assert aliases_deleted == 3
+    assert dispatcher.get_session(db, "$old") is None
+    assert db.execute("SELECT COUNT(*) FROM event_aliases").fetchone()[0] == 0

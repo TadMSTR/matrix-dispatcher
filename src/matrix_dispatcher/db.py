@@ -204,13 +204,24 @@ def delete_pending_approval(db: sqlite3.Connection, approval_id: str) -> None:
 
 def run_cleanup(db: sqlite3.Connection, retention_days: int) -> tuple[int, int]:
     cutoff = int(time.time()) - retention_days * 86400
+    # event_aliases.thread_root_id REFERENCES sessions(thread_root_id) with FK
+    # enforcement on and no ON DELETE CASCADE, so the referencing alias rows must be
+    # removed BEFORE the sessions they point at — otherwise the session DELETE raises
+    # sqlite3.IntegrityError (FOREIGN KEY constraint failed) and retention never runs.
+    cur = db.execute(
+        "DELETE FROM event_aliases WHERE thread_root_id IN "
+        "(SELECT thread_root_id FROM sessions WHERE last_used_at < ?)",
+        (cutoff,),
+    )
+    aliases_deleted = cur.rowcount
     cur = db.execute("DELETE FROM sessions WHERE last_used_at < ?", (cutoff,))
     sessions_deleted = cur.rowcount
+    # Defensive sweep of any orphaned aliases (e.g. rows left by an older code path).
     cur = db.execute(
         "DELETE FROM event_aliases "
         "WHERE thread_root_id NOT IN (SELECT thread_root_id FROM sessions)"
     )
-    aliases_deleted = cur.rowcount
+    aliases_deleted += cur.rowcount
     db.commit()
     log.info(
         "action=cleanup sessions_deleted=%d aliases_deleted=%d retention_days=%d",

@@ -6,7 +6,20 @@
 
 Monolith split — the flat ~1.7k-line `dispatcher.py` is now a `src/matrix_dispatcher/`
 package. Pure structural refactor: **no runtime behaviour change**, guarded by the
-existing ~98% test suite (127 tests passing, coverage held at parity).
+existing ~98% test suite. Also folds in one pre-existing retention bug surfaced by the
+build's security audit (128 tests passing, coverage held at parity).
+
+### Fixed
+- **Retention cleanup no longer fails with `FOREIGN KEY constraint failed`.**
+  `run_cleanup` deleted `sessions` rows before the `event_aliases` rows that reference
+  them; with FK enforcement on (as `open_db` sets) and no `ON DELETE CASCADE`, this
+  raised `sqlite3.IntegrityError` for any session that had ever had an alias registered
+  — i.e. effectively every session — so 30-day retention silently never ran
+  (`cleanup_loop`) or exited non-zero (`--cleanup`). Referenced aliases are now deleted
+  first, then the sessions, then any orphaned aliases are swept. Pre-existing bug (not
+  introduced by the split); found by the monolith-split audit and verified fixed against
+  a copy of the live DB. The test `db` fixture now enables `PRAGMA foreign_keys=ON` to
+  match production, turning the retention tests into a real regression guard.
 
 ### Changed
 - **Public import paths changed.** The daemon is now the `matrix_dispatcher` package

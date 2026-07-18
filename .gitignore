@@ -6,3 +6,10 @@ config.yml
 *.env
 core.*
 *.core
+
+# Forge / private deployment artifacts — never commit real topology to this public repo.
+# The live deploy files live only in a private deploy repo and on the host, untracked here.
+config.*.yml
+!config.example.yml
+*.forge.*
+*-forge.*

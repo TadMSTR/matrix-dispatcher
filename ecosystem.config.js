@@ -1,14 +1,18 @@
+// PM2 ecosystem file. Paths resolve relative to this file / $HOME so the repo
+// is portable — no hardcoded home directory.
+const path = require("path");
+
 module.exports = {
   apps: [
     {
       name: "matrix-dispatcher",
-      script: "/home/ted/repos/personal/matrix-dispatcher/start.sh",
+      script: path.join(__dirname, "start.sh"),
       interpreter: "bash",
-      cwd: "/home/ted/repos/personal/matrix-dispatcher",
+      cwd: __dirname,
       restart_delay: 5000,
       max_restarts: 10,
-      out_file: "/home/ted/.pm2/logs/matrix-dispatcher-out.log",
-      error_file: "/home/ted/.pm2/logs/matrix-dispatcher-error.log",
+      out_file: path.join(process.env.HOME, ".pm2/logs/matrix-dispatcher-out.log"),
+      error_file: path.join(process.env.HOME, ".pm2/logs/matrix-dispatcher-error.log"),
       log_date_format: "YYYY-MM-DD HH:mm:ss",
     },
   ],

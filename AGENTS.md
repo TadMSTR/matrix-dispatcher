@@ -60,11 +60,37 @@ deploy repo and are gitignored here (`*.forge.*`, `*-forge.*`).
 
 Config lives in `config.yml` (gitignored). `config.example.yml` is the reference. Credentials are loaded from `DISPATCHER_*` env vars asserted at startup — the bot will not start if any required credential is missing.
 
-**`AGENT_REGISTRY_DSN`** (env, SMCP-38) — Postgres DSN for the agent-postgres session
-registry, e.g. `postgresql://dispatcher_registry:***@127.0.0.1:5433/agent_registry`.
-Provisioned in the PM2 env from Vault, not `config.yml`. Unset ⇒ HITL resume-on-approval is
-off and the dispatcher behaves exactly as before this feature (fail-open by design — see
-`registry.py`). Each agent entry in `config.yml` also accepts an optional
+**`AGENT_REGISTRY_DSN`** (env, SMCP-38, v0.5.1 resolution order SMCP-42) — Postgres DSN for
+the agent-postgres session registry, e.g.
+`postgresql://dispatcher_registry:***@127.0.0.1:5433/agent_registry`. `get_registry()`
+resolves it in order, at first use:
+
+1. **Vault** — if `VAULT_ADDR`, `DISPATCHER_REGISTRY_VAULT_ROLE_ID`, and
+   `DISPATCHER_REGISTRY_VAULT_SECRET_ID` are all set, a one-shot AppRole
+   login → KV-v2 read of `agents/shared` (key `AGENT_REGISTRY_DSN`) → self
+   token-revoke runs in a thread (`hvac` has no async client). This is a
+   single login-read-discard, not a background renewal loop like
+   scoped-mcp's Vault credential source — the client and its token fall out
+   of scope as soon as the DSN is extracted.
+2. **Plaintext env fallback** — if Vault is unconfigured, or the read fails
+   for any reason (network, auth, missing key), falls back unchanged to the
+   plaintext `AGENT_REGISTRY_DSN` env var.
+3. **Unset** ⇒ HITL resume-on-approval is off and the dispatcher behaves
+   exactly as before this feature (fail-open by design — see `registry.py`).
+
+`hvac` is imported lazily inside the Vault read path (optional-import style,
+same pattern as `asyncpg` in `_build_pool`) so a missing install falls
+straight through to step 2 rather than crashing the process — though both
+`hvac` and `asyncpg` are currently pinned in `pyproject.toml`'s core
+`dependencies`, so a standard install always has them available.
+
+This resolution order is currently inert on forge: it's live in code as of
+v0.5.1 but the `dispatcher-registry-reader` AppRole and the two
+`DISPATCHER_REGISTRY_VAULT_*` env vars are not yet provisioned (pending
+sysadmin's Phase C) — until then every process falls straight to step 2 and
+behaves exactly as v0.5.0 (plaintext env only).
+
+Each agent entry in `config.yml` also accepts an optional
 `scoped_mcp_url` (e.g. `http://127.0.0.1:8471`), a best-effort value recorded in the
 `sessions` registry row for that agent; it is not on the resume hot path and can be omitted.
 
